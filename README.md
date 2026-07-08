@@ -1,56 +1,93 @@
 # Orchex
 
-## Functional Requirement
+## Functional Requirements
 
-Candidate: how the workflow should get trigger ? via webhooks, scheduler or manual.  
-Interviewer: lets start with manual but should be extensible.
+### 1) Workflow Triggering
 
-Candidate: what kind of nodes do we need to support ? Triggers, Integration Actions, General API Node,  
-Conditional Nodes, Agent Node, Function Node, Scheduler, Response, Router ?  
-Interviewer: At a minimum we will support General API Node, Conditional Node, Function Node, Integration Action Node & Response Node
+**Candidate:** How should the workflow be triggered: webhooks, scheduler, or manual?  
+**Interviewer:** Let's start with manual, but it should be extensible.
 
-Candidate: okay so we have nodes and edges, we must define how each nodes get connected to other nodes.  
-directed, can their be cycle, can we have multiple branches from same node each branch runs concurrently, which all nodes can connect one, two and more than two node.  
-Interviewer: we will have directed graph (from = to), and cycle is disallowed (DAG).
+### 2) Node Support
 
-    Response Node = 1 Incoming, 0 Outgoing
-    Start Node = 0 Incoming, 1 Outgoing
-    Conditional Node = 1 Incoming, 2 Outgoing
-    Function Node = 1 Incoming, 1 Outgoing
-    General Api Node = 1 Incoming, 1 Outgoing
-    Integration Action Node = 1 Incoming, 1 Outgoing
+**Candidate:** What kind of nodes do we need to support: Triggers, Integration Actions, General API Node, Conditional Nodes, Agent Node, Function Node, Scheduler, Response, Router?  
+**Interviewer:** At a minimum, we will support:
 
-Candidate: this looks good, are we targeting to handle errors ? what if conditional node fails (incoming corrupted data), function node fails (execution failed for unknown reason), in integration action and api node, what if response with status other than 2\*\* (token expired, request time outs).  
-Interviewer: we must handle this error gracefully.
+- General API Node
+- Conditional Node
+- Function Node
+- Integration Action Node
+- Response Node
 
-Candidate: should we support atomic workflow execution, whole workflow rollback if one of the node fails and mark it as "FAILED" or we need to have an ability to start workflow from where it failed.  
-Interviewer: for simplicity lets just have ability to start workflow from where it failed, if time persist we will talk about atomic workflow exection
+### 3) Graph and Connection Rules
 
-Candidate: do we need to store node level traces and workflow level logs for each workflow ?  
-Interviewer: lets store the workflow level logs and if time persist we will add node level traces.
+**Candidate:** We have nodes and edges; how should nodes connect? Is it directed? Can there be cycles? Can we have branching and concurrency? Which nodes can connect to one, two, or more nodes?  
+**Interviewer:** We will use a directed graph (`from -> to`), and cycles are disallowed (DAG).
 
-Candidate: How many times workflows are run per day and how many combined user workflows we have ?  
-Interviewer: 1M times/day , 100K combined workflows
+| Node Type               | Incoming | Outgoing |
+| ----------------------- | -------- | -------- |
+| Response Node           | 1        | 0        |
+| Start Node              | 0        | 1        |
+| Conditional Node        | 1        | 2        |
+| Function Node           | 1        | 1        |
+| General API Node        | 1        | 1        |
+| Integration Action Node | 1        | 1        |
 
-Candidate: Do we need to assume we have Integrations and their Credentials already build by other team or we need to build it ?  
-Interviewer: for simplicity just assume we already have Integration Infrastruture and Auth in Place. We will use Composio.
+### 4) Error Handling
 
-## Non Functional Requirements
+**Candidate:** Should we handle failures gracefully? For example: corrupted incoming data at Conditional Node, function execution failures, integration/API responses outside `2xx` (token expiry, timeout).  
+**Interviewer:** Yes, we must handle these errors gracefully.
 
-**Reliability**  
-- we should be able to start our workflow from where it failed.
+### 5) Failure Recovery Strategy
 
-**Scalability**  
-- as we have assumed 100K workflows, 1M runs / day, then on average at least 10 workflow runs per day and nearly at any second nearly 10 are running.
-    - 10 w/f running per day from 1M.
-    - at any given second at least 10 w/f are running. QPS for new workflow run = 10 QPS, peak -> 10 * 10 = 100 QPS
-    - 600 workflow per min if each of them takes 1 minute (we need to take care of disk I/O, concurrency as well as reliability)
-    - as this is throughput intense. so it should be able to handle 600 workflows together at least and during peak 60K workflows together
+**Candidate:** Do we need atomic workflow execution (full rollback on failure and mark as `FAILED`), or should we support resume-from-failure?  
+**Interviewer:** For simplicity, start with resume-from-failure. We can discuss atomic execution later if time permits.
 
-**Read heavy or write heavy**  
-- our system is write heavy. we log every state transition as well as have traces of what happened in each node of workflow, but we still have clear relation between entities.
+### 6) Observability Scope
 
-    > relational databases are not generally good for write heavy operations, but to note our system is write heavy due to analytics, historic logs, traces of each node state transition, so we can use postgres for OLTP and clickhouse for OLAP.
+**Candidate:** Do we need node-level traces and workflow-level logs for each run?  
+**Interviewer:** Store workflow-level logs first; we can add node-level traces later if time permits.
 
-**Eventual Consistency**  
-- We need to achieve eventual consistency, few millisecond delays in traces and logs are fine.
+### 7) Scale Assumptions
+
+**Candidate:** How many runs per day and how many total user workflows are expected?  
+**Interviewer:** `1M` runs/day and `100K` combined workflows.
+
+### 8) Integration Infrastructure
+
+**Candidate:** Should we build integrations and credentials, or assume they already exist?  
+**Interviewer:** Assume integration infrastructure and auth are already in place. We will use Composio.
+
+## Non-Functional Requirements
+
+### Reliability
+
+- The system should support restarting workflow execution from the point of failure.
+
+### Scalability
+
+- Assumption: `100K` workflows and `1M` runs/day.
+- Approximation: ~`10` new workflow starts/second on average.
+- Target ingest QPS for new workflow runs:
+  - Baseline: `10 QPS`
+  - Peak: `100 QPS` (`10x` burst)
+- Throughput expectation:
+  - `600` workflows/minute if average run time is ~1 minute
+  - System should handle at least `600` concurrent workflows
+  - During peak, target up to `60K` concurrent workflows
+- Design must account for disk I/O, concurrency control, and reliability under high throughput.
+
+### Data Characteristics (Write Heavy)
+
+- The system is write-heavy due to:
+  - frequent state-transition logging
+  - node execution traces
+  - historical and analytics data
+- Despite write-heavy behavior, entity relationships remain important.
+- Storage strategy:
+  - `Postgres` for OLTP
+  - `ClickHouse` for OLAP
+
+### Consistency Model
+
+- Eventual consistency is acceptable.
+- Millisecond-level delays in traces and logs are acceptable.
