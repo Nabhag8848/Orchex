@@ -20,17 +20,17 @@
 
 ### 3) Graph and Connection Rules
 
-**Candidate:** We have nodes and edges; how should nodes connect? Is it directed? Can there be cycles? Can we have branching and concurrency? Which nodes can connect to one, two, or more nodes?  
+**Candidate:** We have nodes and edges; how should nodes connect? Is it directed? Can there be cycles? Can we have branching and concurrency? What in-degree / out-degree should each node type allow?  
 **Interviewer:** We will use a directed graph (`from -> to`), and cycles are disallowed (DAG).
 
-| Node Type               | Incoming | Outgoing |
-| ----------------------- | -------- | -------- |
-| Response Node           | 1        | 0        |
-| Start Node              | 0        | 1        |
-| Conditional Node        | 1        | 2        |
-| Function Node           | 1        | 1        |
-| General API Node        | 1        | 1        |
-| Integration Action Node | 1        | 1        |
+| Node Type               | In-degree | Out-degree |
+| ----------------------- | --------- | ---------- |
+| Response Node           | 1         | 0          |
+| Start Node              | 0         | 1          |
+| Conditional Node        | 1         | 2          |
+| Function Node           | 1         | 1          |
+| General API Node        | 1         | 1          |
+| Integration Action Node | 1         | 1          |
 
 ### 4) Error Handling
 
