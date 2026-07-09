@@ -1,0 +1,164 @@
+// Orchex — Postgres OLTP schema
+// Visualize at https://dbdiagram.io or with the DBML CLI.
+//
+// Related: README.md (functional + non-functional requirements)
+// Graph validation rules mirror data-structure/workflow-graph.go
+
+Project Orchex {
+  database_type: 'PostgreSQL'
+  Note: '''
+    OLTP store for workflow definitions and active run state.
+  '''
+}
+
+// ---------------------------------------------------------------------------
+// Reference data
+// ---------------------------------------------------------------------------
+
+Table node_types {
+  id uuid [pk, default: `gen_random_uuid()`]
+  type text [not null, unique, note: 'start | conditional | function | api | integration | response']
+  display_name text [not null]
+  min_in_degree int [not null]
+  max_in_degree int [not null]
+  min_out_degree int [not null]
+  max_out_degree int [not null]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+
+  Note: '''
+    Seeded reference catalog. Degree bounds enforce README graph rules at publish time.
+
+    | type         | in | out |
+    |--------------|----|-----|
+    | start        | 0  | 1   |
+    | response     | 1  | 0   |
+    | conditional  | 1  | 2   |
+    | function     | 1  | 1   |
+    | api          | 1  | 1   |
+    | integration  | 1  | 1   |
+  '''
+}
+
+// ---------------------------------------------------------------------------
+// Workflow definition (draft + published versions)
+// ---------------------------------------------------------------------------
+
+Enum workflow_status {
+  draft
+  published
+  archived
+}
+
+Table workflows {
+  id uuid [pk, default: `gen_random_uuid()`]
+  name text [not null]
+  description text
+  status workflow_status [not null, default: 'draft']
+  latest_published_version_id uuid [ref: > workflow_versions.id]
+  latest_version_id uuid [ref: > workflow_versions.id]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+  last_published_at timestamptz [note: 'NULL until first publish']
+  
+  Note: '''
+    Mutable workflow container.
+    latest_published_version_id points to the currently live published version (used for new runs).
+    latest_version_id points to the latest editable head (draft or published).
+    When no draft exists, both IDs are equal.
+  '''
+}
+
+Table workflow_versions {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workflow_id uuid [not null, ref: > workflows.id]
+  version int [not null, default: 1]
+  created_at timestamptz [not null, default: `now()`]
+  last_updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+  published_at timestamptz
+
+  Note: 'Editable until published. After publish, treat this version as immutable. Runs always pin to a specific published version.'
+}
+
+// ---------------------------------------------------------------------------
+// Graph: nodes + edges (DAG)
+// ---------------------------------------------------------------------------
+
+Table nodes {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workflow_version_id uuid [not null, ref: > workflow_versions.id]
+  node_type_id uuid [not null, ref: > node_types.id]
+  name text [not null]
+  position_x float [note: 'UI layout only']
+  position_y float [note: 'UI layout only']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+
+  Note: '''
+    Steps in a published workflow graph. Draft editing may use a parallel draft graph
+    or the latest unpublished version — implementation choice left to the API layer.
+  '''
+}
+
+Enum edge_label {
+  default
+  true
+  false
+}
+
+Table workflow_edges {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workflow_version_id uuid [not null, ref: > workflow_versions.id]
+  from_node_id uuid [not null, ref: > nodes.id]
+  to_node_id uuid [not null, ref: > nodes.id]
+  label edge_label [not null, default: 'default']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+
+  Note: '''
+    Directed edges (from -> to). Cycles disallowed — validated at publish time (DAG).
+    Conditional nodes use label=true and label=false for their two outgoing edges.
+  '''
+}
+
+// ---------------------------------------------------------------------------
+// Execution (runtime)
+// ---------------------------------------------------------------------------
+
+Enum trigger_type {
+  manual
+  webhook
+  scheduler
+}
+
+Enum workflow_run_status {
+  pending
+  running
+  paused
+  failed
+  completed
+  cancelled
+}
+
+Table workflow_runs {
+  id uuid [pk, default: `gen_random_uuid()`]
+  workflow_id uuid [not null, ref: > workflows.id]
+  workflow_version_id uuid [not null, ref: > workflow_versions.id]
+  status workflow_run_status [not null, default: 'pending']
+  trigger_type trigger_type [not null, default: 'manual']
+  current_node_id uuid [not null, ref: > nodes.id]
+  started_at timestamptz 
+  paused_at timestamptz 
+  cancelled_at timestamptz 
+  completed_at timestamptz 
+  failed_at timestamptz 
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
+
+  Note: '''
+    One execution of a published workflow version.
+    Resume-from-failure uses current_node_id + context.
+  '''
+}
+
+
