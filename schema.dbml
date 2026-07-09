@@ -15,9 +15,17 @@ Project Orchex {
 // Reference data
 // ---------------------------------------------------------------------------
 
+Enum node_category {
+  trigger
+  logic
+  action
+  terminal
+}
+
 Table node_types {
   id uuid [pk, default: `gen_random_uuid()`]
   type text [not null, unique, note: 'start | conditional | function | api | integration | response']
+  category node_category [not null]
   display_name text [not null]
   min_in_degree int [not null]
   max_in_degree int [not null]
@@ -29,14 +37,14 @@ Table node_types {
   Note: '''
     Seeded reference catalog. Degree bounds enforce README graph rules at publish time.
 
-    | type         | in | out |
-    |--------------|----|-----|
-    | start        | 0  | 1   |
-    | response     | 1  | 0   |
-    | conditional  | 1  | 2   |
-    | function     | 1  | 1   |
-    | api          | 1  | 1   |
-    | integration  | 1  | 1   |
+    | type         | category  | in | out |
+    |--------------|-----------|----|-----|
+    | start        | trigger   | 0  | 1   |
+    | response     | terminal  | 1  | 0   |
+    | conditional  | logic     | 1  | 2   |
+    | function     | logic     | 1  | 1   |
+    | api          | action    | 1  | 1   |
+    | integration  | action    | 1  | 1   |
   '''
 }
 
