@@ -35,5 +35,56 @@
       }
     },
     "additionalProperties": false
+  },
+  "error_schema": {
+    "type": "object",
+    "required": ["type", "code", "message", "retryable"],
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": ["validation", "internal"],
+        "description": "Error class used for UI routing and retry policy"
+      },
+      "code": {
+        "type": "string",
+        "enum": ["INVALID_TRIGGER_PAYLOAD", "INTERNAL_ERROR"]
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "description": "Short user-facing summary"
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2048,
+        "description": "Optional remediation guidance shown in run history"
+      },
+      "retryable": {
+        "type": "boolean"
+      },
+      "retry_after_ms": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3600000
+      },
+      "details": {
+        "type": "object",
+        "properties": {
+          "parameter": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Config or input field that caused the failure"
+          },
+          "cause": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
   }
 }

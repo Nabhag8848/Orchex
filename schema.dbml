@@ -34,12 +34,14 @@ Table node_types {
   config_schema jsonb [not null, default: '{}', note: 'JSON Schema for nodes.config (builder settings)']
   input_schema jsonb [not null, default: '{}', note: 'JSON Schema for runtime input from upstream']
   output_schema jsonb [not null, default: '{}', note: 'JSON Schema for runtime output to downstream']
+  error_schema jsonb [not null, default: '{}', note: 'JSON Schema for node executor error envelope (type, code, message, retryable, details)']
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
   Note: '''
     Seeded reference catalog. Degree bounds enforce README graph rules at publish time.
-    config/input/output schemas are JSON Schema documents seeded per type.
+    config/input/output/error schemas are JSON Schema documents seeded per type
+    (see node-type-schemas/).
 
     | type         | category  | in | out | config strictness | i/o strictness |
     |--------------|-----------|----|-----|-------------------|----------------|
@@ -160,6 +162,7 @@ Table workflow_runs {
   status workflow_run_status [not null, default: 'pending']
   trigger_type trigger_type [not null, default: 'manual']
   current_node_id uuid [not null, ref: > nodes.id]
+  error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Cleared on resume/success.']
   started_at timestamptz 
   paused_at timestamptz 
   cancelled_at timestamptz 
@@ -170,7 +173,9 @@ Table workflow_runs {
 
   Note: '''
     One execution of a published workflow version.
-    Resume-from-failure uses current_node_id + context.
+    Resume-from-failure uses current_node_id + error.
+    error wraps the failing node's error_schema payload with node_id for run-level context.
+    Historical logs/traces belong in ClickHouse later — this column is operational state only.
   '''
 }
 
