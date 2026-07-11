@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "integration",
+  "category": "action",
+  "display_name": "Integration Action",
+  "config_schema": {
+    "type": "object",
+    "required": ["provider", "action"],
+    "properties": {
+      "provider": {
+        "const": "composio"
+      },
+      "action": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "description": "Composio action id, e.g. GITHUB_CREATE_ISSUE"
+      },
+      "params": {
+        "type": "object",
+        "description": "Action params; may include templates over input.data",
+        "additionalProperties": {
+          "type": ["object", "array", "string", "number", "boolean", "null"]
+        }
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 300000,
+        "default": 30000
+      }
+    },
+    "additionalProperties": false
+  },
+  "input_schema": {
+    "type": "object",
+    "required": ["data"],
+    "properties": {
+      "data": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["data"],
+    "properties": {
+      "data": {
+        "type": "object",
+        "required": ["action", "result"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          },
+          "result": {
+            "type": ["object", "array", "string", "number", "boolean", "null"]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  }
+}

@@ -31,20 +31,24 @@ Table node_types {
   max_in_degree int [not null]
   min_out_degree int [not null]
   max_out_degree int [not null]
+  config_schema jsonb [not null, default: '{}', note: 'JSON Schema for nodes.config (builder settings)']
+  input_schema jsonb [not null, default: '{}', note: 'JSON Schema for runtime input from upstream']
+  output_schema jsonb [not null, default: '{}', note: 'JSON Schema for runtime output to downstream']
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
   Note: '''
     Seeded reference catalog. Degree bounds enforce README graph rules at publish time.
+    config/input/output schemas are JSON Schema documents seeded per type.
 
-    | type         | category  | in | out |
-    |--------------|-----------|----|-----|
-    | start        | trigger   | 0  | 1   |
-    | response     | terminal  | 1  | 0   |
-    | conditional  | logic     | 1  | 2   |
-    | function     | logic     | 1  | 1   |
-    | api          | action    | 1  | 1   |
-    | integration  | action    | 1  | 1   |
+    | type         | category  | in | out | config strictness | i/o strictness |
+    |--------------|-----------|----|-----|-------------------|----------------|
+    | start        | trigger   | 0  | 1   | optional          | output known   |
+    | response     | terminal  | 1  | 0   | strict            | input loose    |
+    | conditional  | logic     | 1  | 2   | strict            | pass-through   |
+    | function     | logic     | 1  | 1   | strict            | loose object   |
+    | api          | action    | 1  | 1   | strict            | output known   |
+    | integration  | action    | 1  | 1   | strict            | output loose   |
   '''
 }
 
@@ -97,14 +101,15 @@ Table nodes {
   workflow_version_id uuid [not null, ref: > workflow_versions.id]
   node_type_id uuid [not null, ref: > node_types.id]
   name text [not null]
+  config jsonb [not null, default: '{}', note: 'Instance values validated against node_types.config_schema']
   position_x float [note: 'UI layout only']
   position_y float [note: 'UI layout only']
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
   Note: '''
-    Steps in a published workflow graph. Draft editing may use a parallel draft graph
-    or the latest unpublished version — implementation choice left to the API layer.
+    Steps in a workflow graph version.
+    config holds builder settings; runtime i/o is validated against node_types input/output schemas.
   '''
 }
 

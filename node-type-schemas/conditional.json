@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "conditional",
+  "category": "logic",
+  "display_name": "Conditional",
+  "config_schema": {
+    "type": "object",
+    "required": ["expression"],
+    "properties": {
+      "expression": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "Boolean expression over input.data, e.g. data.payload.status == 200"
+      }
+    },
+    "additionalProperties": false
+  },
+  "input_schema": {
+    "type": "object",
+    "required": ["data"],
+    "properties": {
+      "data": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["data"],
+    "properties": {
+      "data": {
+        "type": "object",
+        "required": ["branch"],
+        "properties": {
+          "branch": {
+            "type": "string",
+            "enum": ["true", "false"]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "additionalProperties": false
+  }
+}
