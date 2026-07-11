@@ -1,5 +1,81 @@
 # Orchex
 
+## Design diagrams (Excalidraw)
+
+GitHub Markdown does **not** render raw `.excalidraw` JSON inline (unlike Mermaid). Keep the editable board in-repo and open it in [excalidraw.com](https://excalidraw.com) (☰ → Open) or a VS Code / Cursor Excalidraw extension.
+
+| Board | File |
+| ----- | ---- |
+| Interview requirements + design notes | [`orchex.excalidraw`](./orchex.excalidraw) |
+
+Schema ER overview (renders on GitHub):
+
+```mermaid
+erDiagram
+  node_types ||--o{ nodes : "typed as"
+  workflows ||--o{ workflow_versions : "has versions"
+  workflows ||--o{ workflow_runs : "executed as"
+  workflow_versions ||--o{ nodes : "contains"
+  workflow_versions ||--o{ workflow_edges : "wires"
+  workflow_versions ||--o{ workflow_runs : "pinned by"
+  nodes ||--o{ workflow_edges : "from / to"
+  nodes ||--o{ workflow_runs : "current_node"
+
+  node_types {
+    uuid id PK
+    text type UK
+    text category
+    jsonb config_schema
+    jsonb input_schema
+    jsonb output_schema
+    jsonb error_schema
+  }
+
+  workflows {
+    uuid id PK
+    text name
+    text status
+    uuid latest_published_version_id FK
+    uuid latest_version_id FK
+  }
+
+  workflow_versions {
+    uuid id PK
+    uuid workflow_id FK
+    int version
+    timestamptz published_at
+  }
+
+  nodes {
+    uuid id PK
+    uuid workflow_version_id FK
+    uuid node_type_id FK
+    jsonb config
+  }
+
+  workflow_edges {
+    uuid id PK
+    uuid workflow_version_id FK
+    uuid from_node_id FK
+    uuid to_node_id FK
+    text label
+  }
+
+  workflow_runs {
+    uuid id PK
+    uuid workflow_id FK
+    uuid workflow_version_id FK
+    uuid current_node_id FK
+    jsonb error
+    text status
+  }
+```
+
+Related artifacts:
+
+- [`schema.dbml`](./schema.dbml) — Postgres OLTP schema
+- [`node-type-schemas/`](./node-type-schemas/) — per-type config / input / output / error JSON Schemas
+
 ## Functional Requirements
 
 ### 1) Workflow Triggering
