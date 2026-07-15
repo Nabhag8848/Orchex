@@ -99,7 +99,7 @@ Table workflow_versions {
 // ---------------------------------------------------------------------------
 
 Table nodes {
-  id uuid [pk, default: `gen_random_uuid()`]
+  id uuid [not null, default: `gen_random_uuid()`, note: 'Client-generated logical id; stable across versions']
   workflow_version_id uuid [not null, ref: > workflow_versions.id]
   node_type_id uuid [not null, ref: > node_types.id]
   name text [not null]
@@ -109,8 +109,14 @@ Table nodes {
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
+  indexes {
+    (workflow_version_id, id) [pk]
+  }
+
   Note: '''
     Steps in a workflow graph version.
+    PK is (workflow_version_id, id) so the same client node id can exist on v1 and v2 after fork.
+    Within one version, id must be unique. Remap in Update response only on rare within-version collisions.
     config holds builder settings; runtime i/o is validated against node_types input/output schemas.
   '''
 }
@@ -122,19 +128,28 @@ Enum edge_label {
 }
 
 Table workflow_edges {
-  id uuid [pk, default: `gen_random_uuid()`]
+  id uuid [not null, default: `gen_random_uuid()`, note: 'Client-generated logical id; stable across versions']
   workflow_version_id uuid [not null, ref: > workflow_versions.id]
-  from_node_id uuid [not null, ref: > nodes.id]
-  to_node_id uuid [not null, ref: > nodes.id]
+  from_node_id uuid [not null]
+  to_node_id uuid [not null]
   label edge_label [not null, default: 'default']
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
+  indexes {
+    (workflow_version_id, id) [pk]
+  }
+
   Note: '''
     Directed edges (from -> to). Cycles disallowed — validated at publish time (DAG).
     Conditional nodes use label=true and label=false for their two outgoing edges.
+    PK is (workflow_version_id, id), same fork-stability rule as nodes.
+    from/to FKs are composite: (workflow_version_id, from_node_id|to_node_id) → nodes.
   '''
 }
+
+Ref: workflow_edges.(workflow_version_id, from_node_id) > nodes.(workflow_version_id, id)
+Ref: workflow_edges.(workflow_version_id, to_node_id) > nodes.(workflow_version_id, id)
 
 // ---------------------------------------------------------------------------
 // Execution (runtime)
@@ -161,7 +176,7 @@ Table workflow_runs {
   workflow_version_id uuid [not null, ref: > workflow_versions.id]
   status workflow_run_status [not null, default: 'pending']
   trigger_type trigger_type [not null, default: 'manual']
-  current_node_id uuid [not null, ref: > nodes.id]
+  current_node_id uuid [not null]
   error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Cleared on resume/success.']
   started_at timestamptz 
   paused_at timestamptz 
@@ -174,9 +189,12 @@ Table workflow_runs {
   Note: '''
     One execution of a published workflow version.
     Resume-from-failure uses current_node_id + error.
+    current_node_id FK is composite with workflow_version_id → nodes.
     error wraps the failing node's error_schema payload with node_id for run-level context.
     Historical logs/traces belong in ClickHouse later — this column is operational state only.
   '''
 }
+
+Ref: workflow_runs.(workflow_version_id, current_node_id) > nodes.(workflow_version_id, id)
 
 
