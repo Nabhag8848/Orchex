@@ -1,4 +1,14 @@
+<div align="center">
+
 # Orchex
+
+**A durable workflow builder designed one decision at a time**
+
+Build a graph. Publish an immutable version. Run it reliably. Resume exactly where it failed.
+
+</div>
+
+---
 
 Orchex is a workflow builder. A user draws a flow, publishes it, and asks us to run it reliably.
 
@@ -6,7 +16,23 @@ That sounds simple until the first practical questions arrive. What happens whil
 
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
-The design board in [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth. [`schema.dbml`](./schema.dbml) is the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [!IMPORTANT]
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+
+### At a glance
+
+| Concern | v1 decision |
+| --- | --- |
+| Product | Orchex owns workflow orchestration |
+| Graph | Directed acyclic graph with typed degree rules |
+| Trigger | Manual first; webhook and scheduler later |
+| Recovery | Checkpoint and retry the failed node |
+| Definitions | Mutable draft, immutable published version |
+| Execution | Queue, workers, and isolated Function runtime |
+| Storage | PostgreSQL for OLTP; ClickHouse planned for OLAP |
+| Scale target | 1M runs/day and 100 QPS burst ingestion |
+
+### Contents
 
 - [1. Functional Requirements](#1-functional-requirements)
 - [2. Non-Functional Requirements](#2-non-functional-requirements)
@@ -61,12 +87,14 @@ This separation matters. If every save required a runnable graph, the builder wo
 
 **Candidate:** We support six node types:
 
-- **Start** is an entry-point node: `0` incoming edges and `1` outgoing edge.
-- **Conditional** evaluates an expression and chooses one of two branches: `1` incoming and `2` outgoing edges.
-- **Function** runs JavaScript: `1` incoming and `1` outgoing edge.
-- **General API** makes an HTTP request: `1` incoming and `1` outgoing edge.
-- **Integration Action** invokes a Composio action: `1` incoming and `1` outgoing edge.
-- **Response** ends the flow: `1` incoming edge and `0` outgoing edges.
+| Node | Role | In | Out |
+| --- | --- | :---: | :---: |
+| **Start** | Entry point | `0` | `1` |
+| **Conditional** | Choose a `true` or `false` branch | `1` | `2` |
+| **Function** | Run isolated JavaScript | `1` | `1` |
+| **General API** | Make an HTTP request | `1` | `1` |
+| **Integration Action** | Invoke a Composio action | `1` | `1` |
+| **Response** | Finish the workflow | `1` | `0` |
 
 Normal edges use the label `default`. The two outgoing edges of a Conditional use `true` and `false`. The database enforces one edge per `(workflow version, source node, label)`, which also prevents two `true` branches from the same Conditional.
 
@@ -106,6 +134,23 @@ The workflow status describes its wider lifecycle:
 - `archived`: it has been soft-deleted.
 
 Archiving removes a workflow from normal retrieval and prevents future edits or publishes. There is no unarchive API in v1. Existing runs are different: each run is pinned to a published version, so publishing something newer or archiving the workflow does not rewrite history underneath it.
+
+```mermaid
+stateDiagram-v2
+    state "Draft v1" as DraftV1
+    state "Published v1" as PublishedV1
+    state "Draft v2" as DraftV2
+    state "Published v2" as PublishedV2
+
+    [*] --> DraftV1: Create
+    DraftV1 --> DraftV1: Save
+    DraftV1 --> PublishedV1: Publish
+    PublishedV1 --> DraftV2: Edit full graph
+    DraftV2 --> DraftV2: Save
+    DraftV2 --> PublishedV2: Publish
+    PublishedV1 --> Archived: Archive
+    PublishedV2 --> Archived: Archive
+```
 
 ### How do failures recover?
 
@@ -154,7 +199,8 @@ The worker design must eventually make checkpointing and enqueueing the next nod
 - about 600 concurrent runs if baseline runs last one minute;
 - a stretch target of about 60,000 concurrent runs.
 
-The last figure is a capacity target, not a direct result of `100 starts/sec × 1 minute`. At a one-minute average, 100 QPS gives roughly 6,000 concurrent runs. Reaching 60,000 implies longer-running work, a sustained burst, or both.
+> [!NOTE]
+> The 60,000 figure is a capacity target, not a direct result of `100 starts/sec × 1 minute`. At a one-minute average, 100 QPS gives roughly 6,000 concurrent runs. Reaching 60,000 implies longer-running work, a sustained burst, or both.
 
 ### Data and consistency
 
@@ -186,22 +232,28 @@ Execution checkpoints need strong correctness. Observability can be eventually c
 
 The selected design is a queue-and-worker control plane, with isolated execution only where a node requires it.
 
-```text
-Builder / API client
-        |
-      HTTPS
-        |
-  Load balancer
-    /         \
-Workflow     Workflow
-Builder      Execution
-service      service
-                 |
-                Queue
-                 |
-               Workers
-                 |
-       executor for node type
+```mermaid
+flowchart LR
+    Client["Builder / API client"] -->|HTTPS| LB["Load Balancer"]
+
+    LB --> Builder["Workflow Builder Service"]
+    LB --> Execution["Workflow Execution Service"]
+
+    Builder --> Postgres[("PostgreSQL")]
+    Execution --> Postgres
+    Execution --> Queue["Node-job Queue"]
+    Queue --> Workers["Workers"]
+    Workers --> Postgres
+    Workers --> Registry{"Executor Registry"}
+
+    Registry --> API["General API"]
+    Registry --> Conditional["Conditional"]
+    Registry --> Function["Function"]
+    Registry --> Integration["Integration"]
+    Registry --> Response["Response"]
+
+    Function --> Sandbox["Lambda / E2B-like Sandbox"]
+    Workers -.->|events later| ClickHouse[("ClickHouse")]
 ```
 
 ### How does one node execute?
@@ -233,6 +285,23 @@ Queue jobs carry identity—primarily `run_id` and `node_id`—instead of becomi
 
 The API uses optimistic concurrency for workflow editing. Timestamps are UTC ISO-8601 strings. IDs are UUIDs in storage; readable IDs below are examples only.
 
+### Endpoint index
+
+| Method | Path | Purpose | Success |
+| --- | --- | --- | :---: |
+| `POST` | `/v1/workflows` | Create workflow and empty draft v1 | `201` |
+| `GET` | `/v1/workflows` | List non-archived workflow summaries | `200` |
+| `GET` | `/v1/workflows/:id` | Retrieve latest or published graph | `200` |
+| `PUT` | `/v1/workflows/:id` | Replace the editable graph | `200` |
+| `POST` | `/v1/workflows/:id/publish` | Validate and publish the head | `200` |
+| `DELETE` | `/v1/workflows/:id` | Archive a workflow | `204` |
+| `POST` | `/v1/workflows/:workflow_id/runs` | Start a run | `201` |
+| `GET` | `/v1/runs/:run_id` | Retrieve a run snapshot | `200` |
+| `POST` | `/v1/runs/:run_id/pause` | Soft-pause a run | `200` |
+| `POST` | `/v1/runs/:run_id/resume` | Resume a paused run | `200` |
+| `POST` | `/v1/runs/:run_id/stop` | Cancel a run | `200` |
+| `POST` | `/v1/runs/:run_id/retry` | Retry the failed node | `200` |
+
 ### Shared shapes
 
 **Interviewer:** Which objects appear repeatedly in the API?
@@ -240,6 +309,9 @@ The API uses optimistic concurrency for workflow editing. Timestamps are UTC ISO
 **Candidate:** The API is built around a Workflow, a versioned graph, and a Run.
 
 #### Workflow
+
+<details>
+<summary><strong>Example Workflow JSON</strong></summary>
 
 ```json
 {
@@ -255,9 +327,14 @@ The API uses optimistic concurrency for workflow editing. Timestamps are UTC ISO
 }
 ```
 
+</details>
+
 `description`, `latest_published_version_id`, and `last_published_at` may be `null` when they do not apply.
 
 #### Version graph
+
+<details>
+<summary><strong>Example VersionGraph JSON</strong></summary>
 
 ```json
 {
@@ -284,9 +361,14 @@ The API uses optimistic concurrency for workflow editing. Timestamps are UTC ISO
 }
 ```
 
+</details>
+
 Node and edge IDs are generated by the client. They remain stable when a graph is forked into a new version. `position` belongs to the builder layout; it has no execution meaning.
 
 #### Run
+
+<details>
+<summary><strong>Example Run JSON</strong></summary>
 
 ```json
 {
@@ -307,6 +389,8 @@ Node and edge IDs are generated by the client. They remain stable when a graph i
 }
 ```
 
+</details>
+
 Run status is one of `pending`, `running`, `paused`, `failed`, `completed`, or `cancelled`.
 
 ### Workflow endpoints
@@ -321,6 +405,13 @@ Run status is one of `pending`, `running`, `paused`, `failed`, `completed`, or `
 POST /v1/workflows
 ```
 
+`description` is optional, and the request does not accept a graph. The response is `201 Created` with the Workflow fields plus an empty `graph`. The workflow row and v1 are created in one transaction; validation failures return `400`.
+
+<details>
+<summary><strong>Example request and response</strong></summary>
+
+**Request**
+
 ```json
 {
   "name": "Onboarding",
@@ -328,9 +419,7 @@ POST /v1/workflows
 }
 ```
 
-`description` is optional. The request does not accept a graph.
-
-The response is `201 Created` and contains the Workflow fields plus:
+**Response addition**
 
 ```json
 {
@@ -344,7 +433,7 @@ The response is `201 Created` and contains the Workflow fields plus:
 }
 ```
 
-The workflow row and empty v1 are created in one transaction. Validation failures return `400`.
+</details>
 
 #### List
 
@@ -357,6 +446,9 @@ GET /v1/workflows
 ```
 
 The response is `200 OK`:
+
+<details>
+<summary><strong>Example response</strong></summary>
 
 ```json
 {
@@ -376,6 +468,8 @@ The response is `200 OK`:
   ]
 }
 ```
+
+</details>
 
 Archived workflows are excluded. This is a summary endpoint, so it does not return nodes or edges. Pagination, filtering, and ordering are not part of the current contract.
 
@@ -406,6 +500,9 @@ PUT /v1/workflows/:id
 ```
 
 This is a complete replacement, not a patch:
+
+<details>
+<summary><strong>Example full-graph request</strong></summary>
 
 ```json
 {
@@ -442,6 +539,8 @@ This is a complete replacement, not a patch:
 }
 ```
 
+</details>
+
 Saving performs soft validation:
 
 - every `node_type` is known;
@@ -454,6 +553,9 @@ Saving performs soft validation:
 An incomplete graph is allowed here. Same-version edge integrity is also enforced by composite foreign keys in Postgres when the graph is persisted.
 
 If the head is a draft, the server updates it in place. If the head is already published, the submitted graph becomes a new draft version. The response is `200 OK`:
+
+<details>
+<summary><strong>Example saved-head response</strong></summary>
 
 ```json
 {
@@ -497,6 +599,8 @@ If the head is a draft, the server updates it in place. If the head is already p
 }
 ```
 
+</details>
+
 `graph` is the complete saved head. `id_remaps` reports the rare case where a client ID collides inside the target version and the server has to replace it. The element shape of each remap is not fully specified yet; treat the field as a reserved collision report until we lock the object fields.
 
 Validation failures return `400`, missing or archived workflows return `404`/`410`, and a stale expected version returns `409 Conflict`.
@@ -511,9 +615,7 @@ Validation failures return `400`, missing or archived workflows return `404`/`41
 POST /v1/workflows/:id/publish
 ```
 
-```json
-{}
-```
+Request body: `{}`.
 
 Publish performs hard validation:
 
@@ -524,6 +626,9 @@ Publish performs hard validation:
 Config validity, edge endpoints, and unique IDs remain soft-validation concerns from Update. Same-version edge and checkpoint integrity come from the database foreign keys. Reachability from Start and “exactly one Start” are not yet on the hard-validation checklist.
 
 The response is `200 OK`:
+
+<details>
+<summary><strong>Example publish response</strong></summary>
 
 ```json
 {
@@ -540,6 +645,8 @@ The response is `200 OK`:
   }
 }
 ```
+
+</details>
 
 The response is intentionally thin; the client already has the graph it published. Publishing a head that is already live is an idempotent `200` no-op. Validation failures return `400`; missing or archived workflows return `404`/`410`.
 
@@ -567,11 +674,9 @@ The response is `204 No Content`. This is a soft delete: status becomes `archive
 POST /v1/workflows/:workflow_id/runs
 ```
 
-```json
-{}
-```
+Request body: `{}`. Runtime input is deliberately deferred in v1.
 
-Runtime input is deliberately deferred in v1. The server pins the workflow's `latest_published_version_id`, finds that version's Start node, stores it as `current_node_id`, and returns `201 Created` with a complete Run in `pending`.
+The server pins the workflow's `latest_published_version_id`, finds that version's Start node, stores it as `current_node_id`, and returns `201 Created` with a complete Run in `pending`.
 
 A workflow that is missing, archived, still a draft, or has never been published returns `404`. Concurrent runs are allowed. Start-run idempotency is not defined yet.
 
@@ -597,9 +702,7 @@ The response is `200 OK` with the complete Run snapshot. Runs remain readable in
 POST /v1/runs/:run_id/pause
 ```
 
-```json
-{}
-```
+Request body: `{}`.
 
 Pause is soft. If a worker is already executing a node, it finishes that node and checkpoints it, but does not enqueue the successor.
 
@@ -619,9 +722,7 @@ The `200 OK` response is the complete updated Run with `paused_at` set.
 POST /v1/runs/:run_id/resume
 ```
 
-```json
-{}
-```
+Request body: `{}`.
 
 - `paused` becomes `running` and continues from `current_node_id`;
 - already `running` is an idempotent `200`;
@@ -639,9 +740,7 @@ A failed run uses Retry, not Resume.
 POST /v1/runs/:run_id/stop
 ```
 
-```json
-{}
-```
+Request body: `{}`.
 
 - `pending`, `running`, or `paused` becomes `cancelled`;
 - already `cancelled` is an idempotent `200`;
@@ -659,15 +758,33 @@ The response is the updated Run with `cancelled_at` set. Cancelled is terminal: 
 POST /v1/runs/:run_id/retry
 ```
 
-```json
-{}
-```
+Request body: `{}`.
 
 - `failed` becomes `running`;
 - already `running` is an idempotent `200`;
 - every other state returns `409`.
 
 Retry clears `error` and re-executes `current_node_id` in the same run. We do not create a second run and we do not replay successful nodes.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: Start
+    pending --> running: Worker picks job
+    pending --> paused: Pause
+    pending --> cancelled: Stop
+
+    running --> paused: Pause
+    running --> completed: All nodes succeed
+    running --> failed: Node fails
+    running --> cancelled: Stop
+
+    paused --> running: Resume
+    paused --> cancelled: Stop
+    failed --> running: Retry failed node
+
+    completed --> [*]
+    cancelled --> [*]
+```
 
 ### Worker-driven transitions
 
@@ -839,6 +956,80 @@ This value is current operational state. It is cleared on retry or success. It i
 **Interviewer:** Which tables hold the design and active execution state?
 
 **Candidate:** PostgreSQL owns workflow definitions and active run state through six core tables.
+
+```mermaid
+erDiagram
+    node_types ||--o{ nodes : classifies
+    workflows ||--|{ workflow_versions : owns
+    workflow_versions ||--o{ nodes : contains
+    workflow_versions ||--o{ workflow_edges : contains
+    nodes ||--o{ workflow_edges : starts
+    nodes ||--o{ workflow_edges : ends
+    workflows ||--o{ workflow_runs : has
+    workflow_versions ||--o{ workflow_runs : pins
+    nodes ||--o{ workflow_runs : checkpoints
+
+    node_types {
+        uuid id PK
+        text type UK
+        node_category category
+        int min_in_degree
+        int max_in_degree
+        int min_out_degree
+        int max_out_degree
+        jsonb config_schema
+        jsonb input_schema
+        jsonb output_schema
+        jsonb error_schema
+    }
+
+    workflows {
+        uuid id PK
+        text name
+        text description
+        workflow_status status
+        uuid latest_version_id FK
+        uuid latest_published_version_id FK
+        timestamptz last_published_at
+    }
+
+    workflow_versions {
+        uuid id PK
+        uuid workflow_id FK
+        int version
+        timestamptz published_at
+    }
+
+    nodes {
+        uuid workflow_version_id PK, FK
+        uuid id PK
+        uuid node_type_id FK
+        text name
+        jsonb config
+        float position_x
+        float position_y
+    }
+
+    workflow_edges {
+        uuid workflow_version_id PK, FK
+        uuid id PK
+        uuid from_node_id FK
+        uuid to_node_id FK
+        edge_label label
+    }
+
+    workflow_runs {
+        uuid id PK
+        uuid workflow_id FK
+        uuid workflow_version_id FK
+        workflow_run_status status
+        trigger_type trigger_type
+        uuid current_node_id FK
+        jsonb error
+    }
+```
+
+The diagram is a readable overview. In particular, version and node-name uniqueness are composite—`(workflow_id, version)` and `(workflow_version_id, name)`—rather than single-column constraints. Composite keys, partial indexes, timestamps, nullability, and implementation notes remain fully specified in [`schema.dbml`](./schema.dbml).
 
 ### `node_types`
 
