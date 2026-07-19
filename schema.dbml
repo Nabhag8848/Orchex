@@ -192,7 +192,7 @@ Table workflow_runs {
   status workflow_run_status [not null, default: 'pending']
   trigger_type trigger_type [not null, default: 'manual']
   current_node_id uuid [not null, note: 'Checkpoint. Set to start node on create; never NULL']
-  error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Cleared on resume/success.']
+  error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Cleared on retry/success (not on pause-Resume).']
   started_at timestamptz [note: 'NULL while pending; set when execution begins']
   paused_at timestamptz [note: 'NULL unless status=paused']
   cancelled_at timestamptz [note: 'NULL unless status=cancelled']
