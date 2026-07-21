@@ -17,7 +17,7 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth, including the queue and failure-handling deep dive. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, and the queue-product decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
@@ -28,7 +28,7 @@ This document tells the story of the design as a conversation between an intervi
 | Trigger      | Manual first; webhook and scheduler later                           |
 | Recovery     | Checkpoint, auto-retry transient errors, then retry the failed node |
 | Definitions  | Mutable draft, immutable published version                          |
-| Execution    | Queue, workers, and isolated Function runtime                       |
+| Execution    | Outbox + relay → SQS → workers; DLQ after 5 deliveries              |
 | Storage      | PostgreSQL for OLTP; ClickHouse planned for OLAP                    |
 | Scale target | 1M runs/day and 100 QPS burst ingestion                             |
 
@@ -242,7 +242,7 @@ flowchart LR
 
     Builder --> Postgres[("PostgreSQL")]
     Execution --> Postgres
-    Execution --> Queue["Node-job Queue"]
+    Execution --> Queue["SQS (node jobs)"]
     Queue --> Workers["Workers"]
     Workers --> Postgres
     Workers --> Registry{"Executor Registry"}
@@ -1153,13 +1153,13 @@ flowchart LR
     LB --> Exec["Execution Service"]
     Exec -->|"1. create run + first job<br/>(one transaction)"| PG[("PostgreSQL<br/>workflow_runs + outbox")]
     PG -->|"2. relay reads due jobs"| Relay["Relay"]
-    Relay -->|"3. push {run_id, node_id, attempt}"| Q["Node-job queue"]
-    Q -->|"4. worker takes job on a lease"| W["Workers"]
+    Relay -->|"3. push {run_id, node_id, attempt}"| Q["SQS standard queue"]
+    Q -->|"4. worker takes job<br/>(visibility timeout)"| W["Workers"]
     W -->|"5. run the node"| Ext["Sandbox / external APIs"]
     W -->|"6. checkpoint + next job<br/>(one transaction)"| PG
-    Q -.->|"same message crashed workers 5x"| DLQ["Dead-letter queue"]
+    Q -.->|"same message crashed workers 5x"| DLQ["SQS dead-letter queue"]
     DLQ --> Watcher["DLQ watcher"]
-    Watcher -->|"mark run failed"| PG
+    Watcher -->|"copy evidence + mark failed"| PG
 ```
 
 The happy path, in words:
@@ -1189,7 +1189,7 @@ Node jobs are to-dos, and the differences bite quickly if you pick the wrong too
 - **Per-message retry.** We retry, delay, and dead-letter individual jobs. Logs track a single read position per consumer — skipping one bad message while keeping the rest is painful.
 - **No replay wanted.** Replaying execution history would re-run side effects. Our source of truth for "where is this run?" is Postgres, not the message history.
 
-We deliberately do not name a queue product here. The design needs only three properties: at-least-once delivery, a per-message lease, and a dead-letter queue. Anything offering those fits. The event log idea is not wasted either — it returns later as the pipe into ClickHouse for observability, where an ordered replayable history is exactly right.
+The design needs only three properties from the queue: at-least-once delivery, a per-message lease, and a dead-letter queue. Anything offering those fits — the concrete product is chosen at the [end of this deep dive](#which-queue-product-do-we-actually-use). The event log idea is not wasted either — it returns later as the pipe into ClickHouse for observability, where an ordered replayable history is exactly right.
 
 ### One queue or six?
 
@@ -1517,11 +1517,129 @@ Summary of every change this deep dive made, in one place:
 
 As before, [`schema.dbml`](./schema.dbml) is the fully specified version — timestamps, nullability, and the exact index definitions live there.
 
+### Which queue product do we actually use?
+
+> [!IMPORTANT]
+> This decision is also drawn on the [`orchex.excalidraw`](./orchex.excalidraw) board — the options, tradeoffs, and the final SQS mapping in picture form.
+
+**Interviewer:** The design so far says "any queue with at-least-once delivery, a lease, and a DLQ fits." Time to name one. What are the options?
+
+**Candidate:** First, the honest shopping list. Because delay, retry scheduling, and ordering already live in Postgres, the queue must provide only four things:
+
+1. at-least-once delivery — never silently drop a message;
+2. a lease — message hidden while a worker holds it, back if the worker dies;
+3. delivery counting with a DLQ — park a message after 5 deliveries, keep it 14 days;
+4. high availability — no single point of failure.
+
+And it must **not** be asked to provide delays, retries, ordering, replay, or data transport. Messages are tiny identity envelopes at roughly 60–120 messages/second even at 1M runs/day, so throughput does not decide this. Lease mechanics, DLQ support, the HA story, and who operates it decide this.
+
+**Interviewer:** So walk the candidates.
+
+**Candidate:**
+
+| Option                                | Lease model                         | DLQ built in         |                  No SPOF                   | Who operates it                                |
+| ------------------------------------- | ----------------------------------- | -------------------- | :----------------------------------------: | ---------------------------------------------- |
+| Postgres as the queue (`SKIP LOCKED`) | DIY column                          | DIY table            |            tied to PG's own HA             | us (it is our DB)                              |
+| **AWS SQS (standard)**                | **per-message timer**               | yes (redrive policy) |                yes, managed                | nobody                                         |
+| Google Pub/Sub                        | deadline + auto-extend              | yes                  |                yes, managed                | nobody                                         |
+| Azure Service Bus                     | 5-min lock + renew                  | yes (best-in-class)  |                yes, managed                | nobody                                         |
+| RabbitMQ (quorum queues)              | connection-based, per-queue timeout | yes (delivery limit) |      yes, with a 3-node Raft cluster       | us                                             |
+| Redis + BullMQ                        | lock + stalled checker              | partial              | no — async replication can lose acked jobs | us                                             |
+| NATS JetStream                        | per-consumer AckWait                | **no — DIY**         |         yes, with a 3-node cluster         | us                                             |
+| Kafka                                 | —                                   | —                    |                     —                      | already ruled out: event log, not a task queue |
+
+The one-line verdicts:
+
+- **Postgres-as-queue** works at our scale, but we would hand-build lease expiry, delivery counting, and the DLQ, and our database and queue would fail together.
+- **Pub/Sub** and **Service Bus** both push us toward heartbeat-style lease renewal, which we already rejected as more machinery than v1 needs. Service Bus's 5-minute lock is exactly our 300s worst case with zero buffer.
+- **RabbitMQ** has no timed per-message lease at all — redelivery happens when the worker's _connection_ dies, not when a timer expires. Choosing it would force us to revise the per-message lease decision, and we would operate the cluster.
+- **Redis/BullMQ** duplicates machinery we already rebuilt in Postgres (delays, retries), and async replication means a failover can lose acknowledged jobs — the one thing this design cannot tolerate.
+- **NATS JetStream** would make us hand-roll the DLQ, one of our four hard requirements.
+- **SQS** is the only option where "per-message lease sized from the node's timeout" — a decision we locked before naming a product — works natively.
+
+**The decision: AWS SQS, standard queue.** The locked design maps onto it almost word for word:
+
+| Our locked decision              | SQS feature                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| At-least-once delivery           | standard queue default guarantee                                                                   |
+| Per-message lease                | visibility timeout                                                                                 |
+| 5 deliveries then DLQ            | redrive policy, `maxReceiveCount: 5`                                                               |
+| Parked messages kept 14 days     | DLQ retention set to 14 days (SQS's maximum)                                                       |
+| Delay and retry live in Postgres | `DelaySeconds` simply unused — the outbox owns time                                                |
+| No ordering needed               | standard queue, not FIFO — FIFO would add ordering coupling and throughput ceilings we do not want |
+| Messages survive broker failure  | SQS stores messages redundantly across availability zones                                          |
+
+Occasional duplicate deliveries from a standard queue land on the guarded checkpoint updates, which were built for exactly that. Workers receive with long polling (`WaitTimeSeconds: 20`), and batching send/receive/delete up to 10 messages keeps the bill to a few dollars a day at 10M node executions/day.
+
+### How the lease is actually sized on SQS
+
+**Interviewer:** The lease decision said "per message, sized from the node's configured timeout, at enqueue time." Does SQS support that?
+
+**Candidate:** Almost — with one mechanical shift. SQS cannot set visibility per message at _send_ time; visibility is controlled at _receive_ time. So the sizing moves from the relay to the worker:
+
+1. the queue's default visibility timeout stays short — say 60 seconds;
+2. the worker receives a message and looks at the node it is about to run;
+3. if that node's configured timeout is long, the worker calls `ChangeMessageVisibility` to extend the lease to timeout-plus-buffer _before_ starting work.
+
+Same outcome — fast jobs get quick rescue, slow jobs get room — sized by the worker at pickup instead of by the relay at enqueue. One extra API call, only for slow nodes. A mechanics amendment, not a decision reversal.
+
+### Is the queue a single point of failure?
+
+**Interviewer:** We demanded "no SPOF." But the lease already survives worker deaths — do we truly need a highly available queue?
+
+**Candidate:** Worker failure and queue failure are different things, and the design tolerates them differently:
+
+- **Queue unreachable:** the relay cannot push — outbox rows simply sit and buffer; workers cannot receive — runs stall and users see spinners. The moment the queue returns, everything drains and continues. Ugly, but self-healing.
+- **Queue loses an accepted message:** poisonous. The outbox row was already deleted after the push. The run says `running`, no message exists anywhere, and the DLQ watcher never sees it because nothing was dead-lettered — it vanished. That run is frozen forever.
+
+So the property we actually need is less "always answers" and more "never forgets": **durability of accepted messages**. SQS gives both — multi-AZ replication makes the frozen-run trap structurally impossible — which is why the availability question dissolved once the product was chosen.
+
+One gap stays on the books: a **stalled-run sweeper** — a periodic job that finds runs stuck in `running` with no pending outbox row and no plausible in-flight lease, and re-mints the job from `current_node_id` + `current_node_attempt`. It is the only mechanism that would make "Postgres knows where every run stands" _actionable_, and it would also catch a message silently expiring after 14 days in the main queue. **Deferred, deliberately:** SQS's durability removes the scary version of the failure, and v1 stays small. It is recorded in [the deferred list](#7-deep-dives-still-to-come), not forgotten.
+
+### What the DLQ watcher does with the evidence
+
+**Interviewer:** The DLQ keeps parked messages for 14 days as evidence, and the watcher reads them to mark runs failed. Can it do both?
+
+**Candidate:** Not naively — an SQS DLQ is just a regular queue, and a regular queue cannot be a to-do list and a filing cabinet at the same time. Delete the message after processing and the evidence vanishes; leave it and it reappears every visibility expiry, making the watcher re-process old news for 14 days.
+
+The resolution: let the DLQ be the to-do list and let Postgres be the filing cabinet. The watcher
+
+1. reads the parked message,
+2. copies `{run_id, node_id, attempt}` into the run's `error` details in Postgres — where anyone debugging looks first anyway,
+3. marks the run `failed` with the same guarded update as always,
+4. deletes the message.
+
+The evidence now lives forever, attached to the exact failed run, and the queue stays clean.
+
+### The DLQ is never a work list
+
+**Interviewer:** Someday we may want automatic recovery instead of a human pressing Retry. Isn't the DLQ exactly the backlog we would process?
+
+**Candidate:** No — and the two failure worlds explain why. Retryable _node_ errors (500s, timeouts) already retry automatically through the outbox and never reach the DLQ. A DLQ message is a job with a proven record of _crashing five workers in a row_. Feeding it back automatically just crashes five more — an infinite worker-slaughter loop. The DLQ's entire purpose is to be where retrying **stops**.
+
+The legitimate futures both respect that:
+
+- **Ops redrive:** a bad deploy crashed workers, the fix shipped, 200 parked messages are innocent — a _human_ triggers SQS's DLQ redrive to move them back. After-the-fix, not automatic.
+- **Auto-recovery policy:** the DLQ watcher could someday schedule one delayed extra attempt instead of marking the run failed — by writing an **outbox row**, the same birth canal as every other job.
+
+The locked rule: **the DLQ is a quarantine and an evidence bag, never a work list. Jobs are born in exactly one place — the outbox.** Anything resurrecting a run — Retry button, ops redrive, future policy — mints a fresh job through Postgres, never by re-consuming the corpse. One birthplace is also what keeps attempt counters and guards trustworthy.
+
+### Why the relay still polls
+
+**Interviewer:** The relay queries Postgres every few hundred milliseconds, mostly finding nothing. Wasteful?
+
+**Candidate:** Less than it looks — an indexed query on a near-empty table costs microseconds; the real cost is up to one poll interval of added latency per hop. Two upgrades exist when we care:
+
+- **`LISTEN`/`NOTIFY`:** Postgres's built-in doorbell. A trigger on the outbox notifies on commit; the relay sleeps until rung. Near-zero latency — but a doorbell, not a mailbox: signals fired while the relay is down are gone, so a slow safety-net poll must stay. And delayed retry rows need a clock regardless — nothing rings when `available_at` comes due.
+- **CDC / logical decoding (Debezium-style):** subscribe to the WAL itself; durable and push-based, but it swaps a 30-line loop for replication slots to babysit and real infrastructure. Its natural moment is the ClickHouse pipeline later, not this relay.
+
+**Decision: poll-only for v1.** The hybrid (NOTIFY fast path + slow poll backstop) is a pure optimization that changes no contracts, so it can be bolted on the day latency matters.
+
 ## 7. Deep Dives Still To Come
 
 **Interviewer:** Is everything settled now?
 
-**Candidate:** No. The execution spine is settled; these are next:
+**Candidate:** No. The execution spine and the queue product are settled; these are next:
 
 - durable run context and node-output propagation (how a node's output reaches the next node);
 - pause/stop races and long-running node interruption;
@@ -1551,7 +1669,9 @@ As before, [`schema.dbml`](./schema.dbml) is the fully specified version — tim
 - pause/stop races for long-running nodes;
 - ClickHouse event and trace schemas;
 - performance indexes based on production queries;
-- transactional rollback.
+- transactional rollback;
+- stalled-run sweeper (re-mint a job from Postgres when a message vanishes or expires) — deferred because SQS durability removes the scary case;
+- relay `LISTEN`/`NOTIFY` hybrid — pure latency optimization, no contract change.
 
 These are not hidden assumptions. They are the next decisions the design needs.
 
@@ -1561,7 +1681,7 @@ These are not hidden assumptions. They are the next decisions the design needs.
 
 **Candidate:**
 
-- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, and execution deep-dive board.
+- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, and queue-product decision board.
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
 - [`data-structure`](./data-structure) — Go graph implementation and learning notes.
