@@ -192,7 +192,8 @@ Table workflow_runs {
   status workflow_run_status [not null, default: 'pending']
   trigger_type trigger_type [not null, default: 'manual']
   current_node_id uuid [not null, note: 'Checkpoint. Set to start node on create; never NULL']
-  error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Cleared on retry/success (not on pause-Resume).']
+  current_node_attempt int [not null, default: 1, note: 'Attempts on the current node. Reset to 1 on checkpoint advance and on manual Retry; incremented by auto-retry']
+  error jsonb [note: 'NULL when healthy. Last failure: { node_id, error: <node error_schema payload> }. Also holds the transient error between auto-retry attempts. Cleared on retry/success (not on pause-Resume).']
   started_at timestamptz [note: 'NULL while pending; set when execution begins']
   paused_at timestamptz [note: 'NULL unless status=paused']
   cancelled_at timestamptz [note: 'NULL unless status=cancelled']
@@ -201,6 +202,10 @@ Table workflow_runs {
   created_at timestamptz [not null, default: `now()`]
   updated_at timestamptz [not null, default: `now()`, note: 'Auto-updated on every row update by DB/app layer']
 
+  indexes {
+    (id, workflow_version_id) [unique, name: 'uq_workflow_runs_id_version', note: 'Target for composite FKs that must match a run with its pinned version (e.g. outbox rows)']
+  }
+
   Note: '''
     One execution of a published workflow version.
     Resume-from-failure uses current_node_id + error.
@@ -208,9 +213,45 @@ Table workflow_runs {
     error wraps the failing node's error_schema payload with node_id for run-level context.
     Historical logs/traces belong in ClickHouse later — this column is operational state only.
     Timestamp columns are event markers matched to status by the app layer (not DB CHECKs in v1).
+
+    Auto-retry policy (retryable node errors only; crashes are handled by queue lease + outbox):
+    3 total attempts, exponential backoff 10s/40s with +/-25% jitter,
+    RATE_LIMITED respects retry_after_ms via max(backoff, retry_after_ms).
+    Run stays status=running between attempts with the transient error visible in error.
+    Attempts exhausted → status=failed; manual Retry resets current_node_attempt to 1.
+    Workers advance state with guarded (conditional) updates on
+    (current_node_id, current_node_attempt) so duplicate queue deliveries lose the race
+    and drop out instead of double-checkpointing.
   '''
 }
 
 Ref: workflow_runs.(workflow_version_id, current_node_id) > nodes.(workflow_version_id, id)
+
+Table run_node_jobs_outbox {
+  id uuid [pk, default: `gen_random_uuid()`]
+  run_id uuid [not null]
+  workflow_version_id uuid [not null]
+  node_id uuid [not null, note: 'The node the next worker must execute']
+  attempt int [not null, default: 1, note: 'Copied into the queue message; must match workflow_runs.current_node_attempt at delivery or the job is stale']
+  available_at timestamptz [note: 'NULL = deliver immediately; set to now() + backoff for auto-retry jobs. Relay only picks rows where available_at IS NULL OR available_at <= now()']
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: '''
+    Transactional outbox for node jobs (queue messages carry identity only: run_id, node_id, attempt).
+    Inserted in the SAME transaction as the workflow_runs checkpoint/attempt update,
+    so "save progress" and "next job exists" are atomic — a worker crash can never
+    strand a run with a checkpoint but no queue message.
+    A relay process claims due rows with FOR UPDATE SKIP LOCKED, pushes them to the
+    node-job queue, and deletes them on success (row existence = pending; no status column).
+    Duplicate pushes after a relay crash are safe: workers drop stale jobs via the
+    staleness check and guarded checkpoint updates.
+    Both FKs are composite: (run_id, workflow_version_id) must be the run's pinned
+    version, and (workflow_version_id, node_id) must be a node of that version —
+    an outbox row can never mix a run with the wrong graph.
+  '''
+}
+
+Ref: run_node_jobs_outbox.(run_id, workflow_version_id) > workflow_runs.(id, workflow_version_id)
+Ref: run_node_jobs_outbox.(workflow_version_id, node_id) > nodes.(workflow_version_id, id)
 
 

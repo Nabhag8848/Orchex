@@ -17,20 +17,20 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth, including the queue and failure-handling deep dive. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
-| Concern | v1 decision |
-| --- | --- |
-| Product | Orchex owns workflow orchestration |
-| Graph | Directed acyclic graph with typed degree rules |
-| Trigger | Manual first; webhook and scheduler later |
-| Recovery | Checkpoint and retry the failed node |
-| Definitions | Mutable draft, immutable published version |
-| Execution | Queue, workers, and isolated Function runtime |
-| Storage | PostgreSQL for OLTP; ClickHouse planned for OLAP |
-| Scale target | 1M runs/day and 100 QPS burst ingestion |
+| Concern      | v1 decision                                                         |
+| ------------ | ------------------------------------------------------------------- |
+| Product      | Orchex owns workflow orchestration                                  |
+| Graph        | Directed acyclic graph with typed degree rules                      |
+| Trigger      | Manual first; webhook and scheduler later                           |
+| Recovery     | Checkpoint, auto-retry transient errors, then retry the failed node |
+| Definitions  | Mutable draft, immutable published version                          |
+| Execution    | Queue, workers, and isolated Function runtime                       |
+| Storage      | PostgreSQL for OLTP; ClickHouse planned for OLAP                    |
+| Scale target | 1M runs/day and 100 QPS burst ingestion                             |
 
 ### Contents
 
@@ -39,7 +39,8 @@ This document tells the story of the design as a conversation between an intervi
 - [3. High-Level Design](#3-high-level-design)
 - [4. API Design](#4-api-design)
 - [5. Schema Design](#5-schema-design)
-- [6. Deep-Dive Design — Later](#6-deep-dive-design--later)
+- [6. Deep-Dive Design: Execution](#6-deep-dive-design-execution)
+- [7. Deep Dives Still To Come](#7-deep-dives-still-to-come)
 
 ## 1. Functional Requirements
 
@@ -87,14 +88,14 @@ This separation matters. If every save required a runnable graph, the builder wo
 
 **Candidate:** We support six node types:
 
-| Node | Role | In | Out |
-| --- | --- | :---: | :---: |
-| **Start** | Entry point | `0` | `1` |
-| **Conditional** | Choose a `true` or `false` branch | `1` | `2` |
-| **Function** | Run isolated JavaScript | `1` | `1` |
-| **General API** | Make an HTTP request | `1` | `1` |
-| **Integration Action** | Invoke a Composio action | `1` | `1` |
-| **Response** | Finish the workflow | `1` | `0` |
+| Node                   | Role                              | In  | Out |
+| ---------------------- | --------------------------------- | :-: | :-: |
+| **Start**              | Entry point                       | `0` | `1` |
+| **Conditional**        | Choose a `true` or `false` branch | `1` | `2` |
+| **Function**           | Run isolated JavaScript           | `1` | `1` |
+| **General API**        | Make an HTTP request              | `1` | `1` |
+| **Integration Action** | Invoke a Composio action          | `1` | `1` |
+| **Response**           | Finish the workflow               | `1` | `0` |
 
 Normal edges use the label `default`. The two outgoing edges of a Conditional use `true` and `false`. The database enforces one edge per `(workflow version, source node, label)`, which also prevents two `true` branches from the same Conditional.
 
@@ -184,7 +185,7 @@ stateDiagram-v2
 
 **Candidate:** A failed run must be restartable from its checkpoint without replaying successful nodes. Runs are pinned to an immutable published version so later edits cannot change an execution already in progress.
 
-The worker design must eventually make checkpointing and enqueueing the next node atomic—likely through an outbox or equivalent. The durable intermediate run-context shape also still needs to be finalized before resume is production-ready.
+Checkpointing and enqueueing the next node are made atomic through a transactional outbox — settled in the [execution deep dive](#6-deep-dive-design-execution). The durable intermediate run-context shape still needs to be finalized before resume is production-ready.
 
 ### Scale
 
@@ -287,20 +288,20 @@ The API uses optimistic concurrency for workflow editing. Timestamps are UTC ISO
 
 ### Endpoint index
 
-| Method | Path | Purpose | Success |
-| --- | --- | --- | :---: |
-| `POST` | `/v1/workflows` | Create workflow and empty draft v1 | `201` |
-| `GET` | `/v1/workflows` | List non-archived workflow summaries | `200` |
-| `GET` | `/v1/workflows/:id` | Retrieve latest or published graph | `200` |
-| `PUT` | `/v1/workflows/:id` | Replace the editable graph | `200` |
-| `POST` | `/v1/workflows/:id/publish` | Validate and publish the head | `200` |
-| `DELETE` | `/v1/workflows/:id` | Archive a workflow | `204` |
-| `POST` | `/v1/workflows/:workflow_id/runs` | Start a run | `201` |
-| `GET` | `/v1/runs/:run_id` | Retrieve a run snapshot | `200` |
-| `POST` | `/v1/runs/:run_id/pause` | Soft-pause a run | `200` |
-| `POST` | `/v1/runs/:run_id/resume` | Resume a paused run | `200` |
-| `POST` | `/v1/runs/:run_id/stop` | Cancel a run | `200` |
-| `POST` | `/v1/runs/:run_id/retry` | Retry the failed node | `200` |
+| Method   | Path                              | Purpose                              | Success |
+| -------- | --------------------------------- | ------------------------------------ | :-----: |
+| `POST`   | `/v1/workflows`                   | Create workflow and empty draft v1   |  `201`  |
+| `GET`    | `/v1/workflows`                   | List non-archived workflow summaries |  `200`  |
+| `GET`    | `/v1/workflows/:id`               | Retrieve latest or published graph   |  `200`  |
+| `PUT`    | `/v1/workflows/:id`               | Replace the editable graph           |  `200`  |
+| `POST`   | `/v1/workflows/:id/publish`       | Validate and publish the head        |  `200`  |
+| `DELETE` | `/v1/workflows/:id`               | Archive a workflow                   |  `204`  |
+| `POST`   | `/v1/workflows/:workflow_id/runs` | Start a run                          |  `201`  |
+| `GET`    | `/v1/runs/:run_id`                | Retrieve a run snapshot              |  `200`  |
+| `POST`   | `/v1/runs/:run_id/pause`          | Soft-pause a run                     |  `200`  |
+| `POST`   | `/v1/runs/:run_id/resume`         | Resume a paused run                  |  `200`  |
+| `POST`   | `/v1/runs/:run_id/stop`           | Cancel a run                         |  `200`  |
+| `POST`   | `/v1/runs/:run_id/retry`          | Retry the failed node                |  `200`  |
 
 ### Shared shapes
 
@@ -812,6 +813,9 @@ stateDiagram-v2
 
 **Candidate:** The graph shape is important, but so are relational guarantees. A run must point to a real published version, an edge must not cross versions, and a checkpoint must belong to the exact graph the run pinned. PostgreSQL gives us those constraints while JSONB handles type-specific node configuration.
 
+> [!NOTE]
+> This section covers the baseline tables. Later deep dives extend the schema as decisions are made — the [execution deep dive](#6-deep-dive-design-execution) already adds an outbox table, a retry counter, and their integrity constraints, explained [with examples there](#what-this-deep-dive-changed-in-the-schema).
+
 ### How are node contracts represented?
 
 **Interviewer:** Different node types accept different configuration and runtime data. Do we hard-code every shape in each service?
@@ -1133,17 +1137,393 @@ We intentionally do not keep permanent node traces in this OLTP table. PostgreSQ
 
 Listing, status, timestamp, foreign-key, and worker-polling indexes depend on real query patterns. They are deferred until those patterns exist rather than added speculatively.
 
-## 6. Deep-Dive Design — Later
+## 6. Deep-Dive Design: Execution
 
-**Interviewer:** Are all production details settled in this document?
+This is the first deep dive: what exactly sits between "start a run" and "the run finished", and what happens when things break. The decisions here are drawn on the execution deep-dive section of the [`orchex.excalidraw`](./orchex.excalidraw) board.
 
-**Candidate:** No. This README establishes the requirements, boundaries, contracts, and high-level choices. We will add focused deep dives as each subsystem becomes implementation-ready.
+### The picture first
 
-Planned deep dives include:
+**Interviewer:** Section 3 showed the execution service putting jobs into a queue and workers pulling them out. Is that still the whole story?
 
-- worker leasing, duplicate delivery, poison messages, and retry backoff;
-- durable run context and node-output propagation;
-- atomic checkpoint-and-enqueue through an outbox or equivalent;
+**Candidate:** Almost, but one important thing changed: **workers never talk to the queue directly anymore.** Everything a worker decides is written to Postgres, and a small process called the relay moves jobs from Postgres into the queue. Here is the full flow:
+
+```mermaid
+flowchart LR
+    Client["Client"] -->|HTTPS| LB["Load Balancer"]
+    LB --> Exec["Execution Service"]
+    Exec -->|"1. create run + first job<br/>(one transaction)"| PG[("PostgreSQL<br/>workflow_runs + outbox")]
+    PG -->|"2. relay reads due jobs"| Relay["Relay"]
+    Relay -->|"3. push {run_id, node_id, attempt}"| Q["Node-job queue"]
+    Q -->|"4. worker takes job on a lease"| W["Workers"]
+    W -->|"5. run the node"| Ext["Sandbox / external APIs"]
+    W -->|"6. checkpoint + next job<br/>(one transaction)"| PG
+    Q -.->|"same message crashed workers 5x"| DLQ["Dead-letter queue"]
+    DLQ --> Watcher["DLQ watcher"]
+    Watcher -->|"mark run failed"| PG
+```
+
+The happy path, in words:
+
+1. The user starts a run. The execution service creates the run **and** its first job row in one Postgres transaction.
+2. The relay picks up the job row and pushes a small message to the queue: just `{run_id, node_id, attempt}`.
+3. A worker takes the message, reads the run and its pinned graph from Postgres, and executes the node.
+4. The worker writes two things in one transaction: "the run is now at the next node" and "a job for that next node must be enqueued".
+5. The relay pushes that next job. Steps 3–5 repeat, one node at a time.
+6. When the Response node finishes, the worker marks the run `completed` and writes no next job. The loop simply stops.
+
+The queue stays dumb on purpose. Messages carry identity only — never data, never state. If the queue lost every message tomorrow, Postgres would still know exactly where every run stands.
+
+### Why a task queue and not an event log?
+
+**Interviewer:** Systems at this scale often use an event log (a Kafka-style append-only stream). Why a task queue?
+
+**Candidate:** Because our unit of work is a **job**, not a fact.
+
+An event log is a history: "this happened, then this happened." Consumers read it in order, at their own pace, and can replay it from the beginning. That is perfect when many readers need the same ordered stream — analytics, audit, dashboards.
+
+A task queue is a to-do list: "someone, do this once." Each message goes to exactly one worker, can be retried on its own, delayed on its own, and quarantined on its own if it is poisonous.
+
+Node jobs are to-dos, and the differences bite quickly if you pick the wrong tool:
+
+- **Independence.** Every job stands alone. In a log, messages behind a slow one in the same partition must wait; one stuck 300-second node would hold up unrelated runs.
+- **Per-message retry.** We retry, delay, and dead-letter individual jobs. Logs track a single read position per consumer — skipping one bad message while keeping the rest is painful.
+- **No replay wanted.** Replaying execution history would re-run side effects. Our source of truth for "where is this run?" is Postgres, not the message history.
+
+We deliberately do not name a queue product here. The design needs only three properties: at-least-once delivery, a per-message lease, and a dead-letter queue. Anything offering those fits. The event log idea is not wasted either — it returns later as the pipe into ClickHouse for observability, where an ordered replayable history is exactly right.
+
+### One queue or six?
+
+**Interviewer:** Six node types with very different speeds — milliseconds for a Conditional, up to 300 seconds for an API call. Separate queues per type?
+
+**Candidate:** One shared queue for v1. The instinct to split comes from a fear: slow jobs clog the line and fast jobs starve behind them. But our slow nodes are slow because they **wait** — on someone else's API, on the sandbox — not because they compute. A worker waiting on an HTTP response can hold many other jobs at the same time, so slow jobs do not block fast ones in practice.
+
+Splitting would mean routing rules in the execution service, in every worker, and in the relay — real complexity for a problem we have not measured. And the escape hatch stays cheap: messages already carry `node_id`, so adding a routing rule later changes no contracts.
+
+### What is a lease, and which kind do we use?
+
+**Interviewer:** A worker takes a job and dies halfway. How does the job survive?
+
+**Candidate:** Through the queue's **lease**. When a worker takes a message, the message is not deleted — it becomes invisible for a while. If the worker finishes and says "done", it is deleted. If the worker never says "done", the message reappears and another worker gets it.
+
+```mermaid
+sequenceDiagram
+    participant Q as Queue
+    participant A as Worker A
+    participant B as Worker B
+    Q->>A: job (lease starts, message hidden)
+    Note over A: 💥 crashes mid-work
+    Note over Q: lease expires,<br/>message visible again
+    Q->>B: same job, fresh start
+    B->>Q: done (message deleted)
+```
+
+Different products name the same idea differently — SQS says _visibility timeout_, Google Pub/Sub says _ack deadline_, orchestration papers say _task lease_ — but it is one concept.
+
+The catch: the lease must be **longer than the slowest legal node**, or the queue redelivers a job that is still running and the same API call fires twice. Three ways to size it:
+
+1. **One flat value for everything** — say 360s. Simple, but a crashed 1-second Conditional job also waits 6 minutes to be rescued.
+2. **Per message** — each node's config already declares its timeout, so we know each job's worst case before enqueueing it. Fast jobs get short leases and quick rescue; slow jobs get room to finish.
+3. **Heartbeat** — start small and let the worker keep extending while alive. Works, but more machinery than v1 needs.
+
+We chose **(2) per-message leases**, sized from the node's configured timeout plus a small buffer.
+
+### The same job arrives twice. Now what?
+
+**Interviewer:** Queues promise at-least-once delivery. So duplicates are guaranteed to happen eventually.
+
+**Candidate:** Yes — a lease that expires a moment too early, a "done" signal lost on the network. We do not try to prevent duplicates; we make them harmless with two checks in the worker.
+
+**Check 1 — before executing:** read the run from Postgres. If the run has already moved past this job's node and attempt, the job is stale. Drop it without executing anything.
+
+**Check 2 — when saving progress:** the checkpoint write is conditional. Not "set the run to the next node" but "set the run to the next node **only if it is still at this one**":
+
+```sql
+UPDATE workflow_runs
+SET current_node_id = 'node_response', current_node_attempt = 1
+WHERE id = 'run_01'
+  AND current_node_id = 'node_api'      -- the guard
+  AND current_node_attempt = 1;
+```
+
+Postgres runs updates on the same row one at a time. If two workers race, the first update succeeds ("1 row changed") and that worker continues; the second finds the guard false ("0 rows changed") and quietly discards its job.
+
+```mermaid
+sequenceDiagram
+    participant A as Worker A
+    participant B as Worker B
+    participant PG as PostgreSQL
+    Note over A,B: both received the same job
+    A->>PG: guarded UPDATE
+    PG-->>A: 1 row changed → I won
+    B->>PG: guarded UPDATE
+    PG-->>B: 0 rows changed → I lost, drop job
+    Note over PG: exactly one checkpoint,<br/>exactly one next job
+```
+
+The residual risk we accept: in a tight race both workers may have already fired the external call, so a side effect can still happen twice. No orchestrator can fix that from its own side; it needs the external API to support idempotency keys, which we defer.
+
+### The crash between two steps: the outbox
+
+**Interviewer:** After running a node the worker must save the checkpoint in Postgres _and_ enqueue the next job in the queue. Two systems — what if it crashes between the two?
+
+**Candidate:** Without protection, that crash freezes the run forever: the checkpoint says "at `node_response`" but no message for `node_response` exists anywhere, and the old message was already acked. The user sees a spinner that never ends.
+
+Flipping the order does not help — enqueue first and crash before checkpointing, and the new job fails our own staleness check.
+
+The fix is the **transactional outbox**. The worker never touches the queue. It writes the checkpoint _and_ a job row into the `run_node_jobs_outbox` table in **one transaction** — one commit, so both exist or neither does:
+
+```mermaid
+flowchart LR
+    W["Worker"] -->|"one transaction:<br/>checkpoint + outbox row"| PG[("PostgreSQL")]
+    PG -->|"claim due rows<br/>(FOR UPDATE SKIP LOCKED)"| R["Relay"]
+    R -->|"push message"| Q["Node-job queue"]
+    R -->|"delete row on success"| PG
+```
+
+The relay loops every few hundred milliseconds: claim due rows, push them to the queue, delete them. `FOR UPDATE SKIP LOCKED` is Postgres for "lock the rows I claimed, and let other relay instances skip them instead of waiting" — so several relays can run at once with zero coordination.
+
+Both relay crash cases are safe:
+
+- Crash **before pushing** → the claim evaporates with the uncommitted transaction; the next pass picks the rows up again.
+- Crash **after pushing, before deleting** → the rows get pushed a second time. Duplicate message — which the previous section already made harmless.
+
+The outbox table is intentionally boring: rows are inserted once, read once, deleted. Never updated. A row's existence _is_ the state "this job still needs to reach the queue".
+
+### Retrying failures automatically
+
+**Interviewer:** A node fails with a transient error — the API returned 500. Does the user really have to press Retry by hand?
+
+**Candidate:** No. But first, a distinction that keeps the whole design honest: there are **two separate failure worlds, and they never mix**.
+
+**World 1 — the node's work failed, the worker is fine.** The API returned 500, the expression crashed, the token expired. The worker is alive to _report_ it through the structured error envelope, and this is the only world where `retryable` means anything.
+
+**World 2 — the worker itself died.** Nobody reports anything. The lease, the outbox, and the guarded updates recover silently. No error envelope is ever written, and `retryable` never enters the picture.
+
+Auto-retry lives purely in World 1:
+
+- A retryable failure (500, timeout, rate limit) does not fail the run. The worker bumps the attempt counter and writes an outbox row with a **delay**: `available_at = now() + backoff`. The relay simply does not pick the row up before that time. The retry is a brand-new message, born through the same outbox as everything else.
+- A non-retryable failure (bad config, HTTP 400, expired auth) fails the run immediately — retrying cannot help.
+- The policy: **3 attempts total, waits of 10s then 40s, each with ±25% random jitter** so a thousand runs hitting the same dying API do not all come back in the same second. A rate-limited error that carries `retry_after_ms` gets whichever wait is longer.
+- Between attempts the run stays `running`, with the transient error visible in `workflow_runs.error` so the UI can show "attempt 2 of 3, retrying at 10:31:07".
+- Attempts exhausted → `failed`, error stored, human decides. Manual Retry resets the counter and mints a fresh job.
+
+```mermaid
+stateDiagram-v2
+    state "executing (attempt N)" as exec
+    state "waiting for backoff<br/>(run still 'running')" as wait
+    exec --> next_node: success
+    exec --> wait: retryable error, N < 3
+    exec --> failed: non-retryable error
+    exec --> failed: retryable error, N = 3
+    wait --> exec: available_at reached,<br/>attempt N+1
+    failed --> exec: manual Retry (N resets to 1)
+```
+
+### Poison messages and the dead-letter queue
+
+**Interviewer:** World 2 has a monster in it: a job that kills every worker that touches it. Out-of-memory on a huge payload, a crash bug. The lease "helpfully" resurrects it, and it kills again.
+
+**Candidate:** That is a **poison message**, and the worker cannot defend itself — it is the one dying. The queue must give up on the job instead.
+
+The queue counts deliveries per message. A healthy message is delivered once, maybe twice after an unlucky lease expiry. A poison message racks up deliveries because no worker ever lives long enough to ack it. **After 5 deliveries, the queue stops redelivering and parks the message in the dead-letter queue.** The killing stops.
+
+(Auto-retries never inflate this counter — each retry is a brand-new message with a fresh count. The counter only climbs when the _same_ message keeps crashing workers.)
+
+Parking the message solves only half the problem. The run is still `running`, and no message exists that will ever move it — the frozen-spinner problem through another door. So a small **DLQ watcher** does the one write the dead worker never could, with the same guard as always:
+
+```sql
+UPDATE workflow_runs
+SET status = 'failed', failed_at = now(),
+    error = '{"node_id": "...", "error": {"type": "internal", "code": "INTERNAL_ERROR",
+              "message": "Execution failed repeatedly.", "retryable": false}}'
+WHERE id = 'run_01'
+  AND current_node_id = '...' AND current_node_attempt = 1
+  AND status = 'running';
+```
+
+The user sees a failed run with a Retry button instead of an eternal spinner. Retry mints a fresh message; if the cause was a since-fixed bad deploy, the run continues, and if the job is truly poison it returns to the DLQ five crashes later.
+
+Parked messages are kept for 14 days as evidence — when someone asks "what kept killing our workers?", the message with its `{run_id, node_id, attempt}` is the starting thread.
+
+### One failure table to rule them all
+
+**Interviewer:** Summarize: for every place this can break, what saves us?
+
+**Candidate:**
+
+| Failure                                       | What saves us                                                        |
+| --------------------------------------------- | -------------------------------------------------------------------- |
+| Worker crashes before executing               | Lease expires → redelivered → fresh worker. Invisible.               |
+| Worker crashes mid-action                     | Same — but the external call may fire twice (accepted residual risk) |
+| Worker crashes before checkpoint commits      | Transaction atomicity: no half-written state; redelivery re-runs     |
+| Worker crashes between checkpoint and enqueue | **Impossible** — outbox made them one transaction                    |
+| Worker crashes after commit, before ack       | Duplicate delivery → staleness check drops it, nothing executes      |
+| Relay crashes before pushing                  | Claim evaporates; next pass retries                                  |
+| Relay crashes after pushing, before deleting  | Duplicate message → guards absorb it                                 |
+| Node reports a retryable error                | Auto-retry: 3 attempts, growing waits, then `failed`                 |
+| Node reports a non-retryable error            | `failed` immediately, structured error stored                        |
+| Job crashes every worker that touches it      | 5 deliveries → DLQ → watcher marks the run `failed`                  |
+
+Each layer lets the one above it be sloppy. The lease may redeliver, the relay may double-push, workers may race — nothing corrupts, because the guarded checkpoint at the bottom decides every conflict.
+
+### What this deep dive changed in the schema
+
+**Interviewer:** All of this machinery must live somewhere. What did the schema gain?
+
+**Candidate:** One new column, one new table, and one new index. Easiest to show with the run we have been using all along: Start → `node_api` → `node_response`, run `run_01`, pinned to version `ver_01`.
+
+#### The new column: `workflow_runs.current_node_attempt`
+
+The run already knew _where_ it is (`current_node_id`). Now it also knows _how many times it has tried to be there_. Watch the two columns move together through a bumpy run:
+
+| What just happened                           | `current_node_id` | `current_node_attempt` |
+| -------------------------------------------- | :---------------: | :--------------------: |
+| Run created                                  |   `node_start`    |          `1`           |
+| Start succeeds, checkpoint advances          |    `node_api`     | `1` (reset — new node) |
+| API returns 500 → auto-retry scheduled       |    `node_api`     |          `2`           |
+| API returns 500 again → last retry scheduled |    `node_api`     |          `3`           |
+| Third try succeeds, checkpoint advances      |  `node_response`  |   `1` (reset again)    |
+
+The counter is also part of every guarded update: a worker may only write "attempt 3 happened" if the run still says attempt 2. Two workers racing on the same retry cannot both win.
+
+#### The new table: `run_node_jobs_outbox`
+
+| Column                | Example value            | Meaning                                                       |
+| --------------------- | ------------------------ | ------------------------------------------------------------- |
+| `run_id`              | `run_01`                 | which run                                                     |
+| `workflow_version_id` | `ver_01`                 | the run's pinned graph                                        |
+| `node_id`             | `node_api`               | which node to execute                                         |
+| `attempt`             | `2`                      | which try this is                                             |
+| `available_at`        | `now() + 10s`, or `NULL` | `NULL` = push immediately; a time = retry waiting for backoff |
+
+A row here means exactly one thing: _"a queue message for this job still needs to be sent."_ Follow `run_01` through the table:
+
+1. Run starts → one transaction inserts the run **and** the row `(run_01, ver_01, node_start, 1, NULL)`.
+2. The relay pushes that message and deletes the row. Table is empty again.
+3. `node_start` succeeds → the worker's transaction inserts `(run_01, ver_01, node_api, 1, NULL)`. Pushed, deleted.
+4. `node_api` fails with a 500 → the worker inserts `(run_01, ver_01, node_api, 2, now() + 10s)`. This row **sits visibly in the table for 10 seconds** — the relay skips rows that are not due yet. `SELECT * FROM run_node_jobs_outbox` literally _is_ the pending-retries dashboard.
+5. Ten seconds pass, the relay pushes it, deletes it, and attempt 2 runs.
+
+Rows are inserted once, read once, deleted — never updated. All state that changes over time lives on `workflow_runs`.
+
+#### The new index, and why the FKs are composite
+
+The outbox row above names both a run **and** a version. What stops a buggy insert from pairing them wrongly — say `(run_01, ver_02, ...)`, a version this run never pinned? Two composite foreign keys, chained:
+
+- `(run_id, workflow_version_id)` must match `workflow_runs (id, workflow_version_id)` — _the version must be the run's pinned version._ For Postgres to accept a foreign key onto that column pair, the pair must be unique on the target table — that is the entire reason the new unique index `workflow_runs (id, workflow_version_id)` exists.
+- `(workflow_version_id, node_id)` must match `nodes (workflow_version_id, id)` — _the node must exist in that version's graph._
+
+Chain them together and an outbox row physically cannot point at the wrong graph: run → its pinned version → a node of that version. It is the same protection `current_node_id` already had, extended to the job pipeline.
+
+#### The whole schema, after this deep dive
+
+**Interviewer:** Put it all together — what does the database look like now?
+
+**Candidate:** The six baseline tables from section 5, plus the outbox and the retry counter. Additions from this deep dive are marked `NEW`:
+
+```mermaid
+erDiagram
+    node_types ||--o{ nodes : classifies
+    workflows ||--|{ workflow_versions : owns
+    workflow_versions ||--o{ nodes : contains
+    workflow_versions ||--o{ workflow_edges : contains
+    nodes ||--o{ workflow_edges : starts
+    nodes ||--o{ workflow_edges : ends
+    workflows ||--o{ workflow_runs : has
+    workflow_versions ||--o{ workflow_runs : pins
+    nodes ||--o{ workflow_runs : checkpoints
+    workflow_runs ||--o{ run_node_jobs_outbox : "feeds jobs (NEW)"
+    nodes ||--o{ run_node_jobs_outbox : "targets (NEW)"
+
+    node_types {
+        uuid id PK
+        text type UK
+        node_category category
+        int min_in_degree
+        int max_in_degree
+        int min_out_degree
+        int max_out_degree
+        jsonb config_schema
+        jsonb input_schema
+        jsonb output_schema
+        jsonb error_schema
+    }
+
+    workflows {
+        uuid id PK
+        text name
+        text description
+        workflow_status status
+        uuid latest_version_id FK
+        uuid latest_published_version_id FK
+        timestamptz last_published_at
+    }
+
+    workflow_versions {
+        uuid id PK
+        uuid workflow_id FK
+        int version
+        timestamptz published_at
+    }
+
+    nodes {
+        uuid workflow_version_id PK, FK
+        uuid id PK
+        uuid node_type_id FK
+        text name
+        jsonb config
+        float position_x
+        float position_y
+    }
+
+    workflow_edges {
+        uuid workflow_version_id PK, FK
+        uuid id PK
+        uuid from_node_id FK
+        uuid to_node_id FK
+        edge_label label
+    }
+
+    workflow_runs {
+        uuid id PK
+        uuid workflow_id FK
+        uuid workflow_version_id FK
+        workflow_run_status status
+        trigger_type trigger_type
+        uuid current_node_id FK
+        int current_node_attempt "NEW"
+        jsonb error
+    }
+
+    run_node_jobs_outbox {
+        uuid id PK "NEW table"
+        uuid run_id FK
+        uuid workflow_version_id FK
+        uuid node_id FK
+        int attempt
+        timestamptz available_at "NULL = send now"
+    }
+```
+
+Summary of every change this deep dive made, in one place:
+
+| Change                                                                     | Kind                    | Why it exists                                                                       |
+| -------------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------- |
+| `workflow_runs.current_node_attempt`                                       | new column              | how many times the current node has been tried; reset on advance and manual Retry   |
+| `run_node_jobs_outbox`                                                     | new table               | jobs written atomically with checkpoints; the relay drains it into the queue        |
+| `run_node_jobs_outbox.available_at`                                        | column on the new table | the entire retry-delay mechanism — one nullable timestamp the relay filters on      |
+| `uq_workflow_runs_id_version` on `workflow_runs (id, workflow_version_id)` | new unique index        | the target a composite FK needs so outbox rows must use the run's pinned version    |
+| Outbox composite FKs → `workflow_runs`, `nodes`                            | new constraints         | a job row can never mix a run with the wrong version or a node from the wrong graph |
+
+As before, [`schema.dbml`](./schema.dbml) is the fully specified version — timestamps, nullability, and the exact index definitions live there.
+
+## 7. Deep Dives Still To Come
+
+**Interviewer:** Is everything settled now?
+
+**Candidate:** No. The execution spine is settled; these are next:
+
+- durable run context and node-output propagation (how a node's output reaches the next node);
 - pause/stop races and long-running node interruption;
 - ClickHouse event, trace, retention, and correlation schemas;
 - executor isolation, timeouts, resource limits, and sandbox adapters;
@@ -1167,9 +1547,8 @@ Planned deep dives include:
 - exact `id_remaps[]` element shape;
 - reachability / exactly-one-Start as hard publish rules;
 - narrowing General API `output_schema.status` to 2xx if we want the schema itself to forbid non-2xx success shapes;
-- retry limits and backoff policy;
+- external idempotency keys, so a tight duplicate race cannot fire the same side effect twice;
 - pause/stop races for long-running nodes;
-- atomic checkpoint-and-enqueue/outbox behavior;
 - ClickHouse event and trace schemas;
 - performance indexes based on production queries;
 - transactional rollback.
@@ -1182,7 +1561,7 @@ These are not hidden assumptions. They are the next decisions the design needs.
 
 **Candidate:**
 
-- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, and schema board.
+- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, and execution deep-dive board.
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
 - [`data-structure`](./data-structure) — Go graph implementation and learning notes.

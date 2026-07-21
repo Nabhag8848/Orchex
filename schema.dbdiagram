@@ -1,14 +1,278 @@
 {
   "version": "2.0.0",
-  "darkMode": false,
+  "darkMode": true,
   "gridEnabling": false,
   "currentViewName": null,
   "defaultView": {
     "detailLevel": "All",
-    "tablePositions": [],
+    "tablePositions": [
+      {
+        "name": "node_types",
+        "schemaName": "public",
+        "x": 12,
+        "y": 12
+      },
+      {
+        "name": "workflows",
+        "schemaName": "public",
+        "x": 584.50830078125,
+        "y": 411
+      },
+      {
+        "name": "workflow_versions",
+        "schemaName": "public",
+        "x": 12,
+        "y": 538
+      },
+      {
+        "name": "nodes",
+        "schemaName": "public",
+        "x": 584.50830078125,
+        "y": 12
+      },
+      {
+        "name": "workflow_edges",
+        "schemaName": "public",
+        "x": 1152.830078125,
+        "y": 12
+      },
+      {
+        "name": "workflow_runs",
+        "schemaName": "public",
+        "x": 1152.830078125,
+        "y": 378
+      },
+      {
+        "name": "run_node_jobs_outbox",
+        "schemaName": "public",
+        "x": 12,
+        "y": 972
+      }
+    ],
     "tableGroupCollapseStates": [],
     "stickyNoteLayouts": [],
-    "referencePaths": []
+    "referencePaths": [
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_versions",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "latest_published_version_id"
+        ],
+        "secondTableName": "workflows",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_versions",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "latest_version_id"
+        ],
+        "secondTableName": "workflows",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflows",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "workflow_id"
+        ],
+        "secondTableName": "workflow_versions",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_versions",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "workflow_version_id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "node_types",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "node_type_id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_versions",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "workflow_version_id"
+        ],
+        "secondTableName": "workflow_edges",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "workflow_version_id",
+          "from_node_id"
+        ],
+        "firstTableName": "workflow_edges",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "workflow_version_id",
+          "id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "workflow_version_id",
+          "to_node_id"
+        ],
+        "firstTableName": "workflow_edges",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "workflow_version_id",
+          "id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflows",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "workflow_id"
+        ],
+        "secondTableName": "workflow_runs",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_versions",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "workflow_version_id"
+        ],
+        "secondTableName": "workflow_runs",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "workflow_version_id",
+          "current_node_id"
+        ],
+        "firstTableName": "workflow_runs",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "workflow_version_id",
+          "id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "id"
+        ],
+        "firstTableName": "workflow_runs",
+        "firstSchemaName": "public",
+        "firstRelation": "1",
+        "secondFieldNames": [
+          "run_id"
+        ],
+        "secondTableName": "run_node_jobs_outbox",
+        "secondSchemaName": "public",
+        "secondRelation": "*",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "workflow_version_id",
+          "node_id"
+        ],
+        "firstTableName": "run_node_jobs_outbox",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "workflow_version_id",
+          "id"
+        ],
+        "secondTableName": "nodes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "run_id",
+          "workflow_version_id"
+        ],
+        "firstTableName": "run_node_jobs_outbox",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id",
+          "workflow_version_id"
+        ],
+        "secondTableName": "workflow_runs",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      }
+    ]
   },
   "views": {}
 }
