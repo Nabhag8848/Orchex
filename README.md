@@ -198,10 +198,8 @@ Checkpointing and enqueueing the next node are made atomic through a transaction
 - roughly 10 new runs per second on average;
 - 100 QPS during a 10x start burst;
 - about 600 concurrent runs if baseline runs last one minute;
-- a stretch target of about 60,000 concurrent runs.
-
-> [!NOTE]
-> The 60,000 figure is a capacity target, not a direct result of `100 starts/sec × 1 minute`. At a one-minute average, 100 QPS gives roughly 6,000 concurrent runs. Reaching 60,000 implies longer-running work, a sustained burst, or both.
+- about 6,000 concurrent at the 100 QPS peak if runs still average one minute;
+- a capacity target of about 60,000 concurrent runs when nodes run longer (not from the one-minute calculation).
 
 ### Data and consistency
 
