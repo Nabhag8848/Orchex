@@ -17,7 +17,7 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, and the queue-product decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, and the OLTP/RDS decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
@@ -29,7 +29,7 @@ This document tells the story of the design as a conversation between an intervi
 | Recovery     | Checkpoint, auto-retry transient errors, then retry the failed node |
 | Definitions  | Mutable draft, immutable published version                          |
 | Execution    | Outbox + relay → SQS → workers; DLQ after 5 deliveries              |
-| Storage      | PostgreSQL for OLTP; ClickHouse planned for OLAP                    |
+| Storage      | Amazon RDS for PostgreSQL (OLTP); ClickHouse planned for OLAP       |
 | Scale target | 1M runs/day and 100 QPS burst ingestion                             |
 
 ### Contents
@@ -40,7 +40,8 @@ This document tells the story of the design as a conversation between an intervi
 - [4. API Design](#4-api-design)
 - [5. Schema Design](#5-schema-design)
 - [6. Deep-Dive Design: Execution](#6-deep-dive-design-execution)
-- [7. Deep Dives Still To Come](#7-deep-dives-still-to-come)
+- [7. Deep-Dive Design: OLTP Database](#7-deep-dive-design-oltp-database)
+- [8. Deep Dives Still To Come](#8-deep-dives-still-to-come)
 
 ## 1. Functional Requirements
 
@@ -205,7 +206,7 @@ Checkpointing and enqueueing the next node are made atomic through a transaction
 
 **Interviewer:** This sounds write-heavy. Where does the data go, and do all reads need immediate consistency?
 
-**Candidate:** PostgreSQL is the OLTP source of truth for definitions, immutable published snapshots, checkpoints, and current run state. ClickHouse is the planned OLAP store for historical logs, node traces, and analytics.
+**Candidate:** PostgreSQL on Amazon RDS is the OLTP source of truth for definitions, immutable published snapshots, checkpoints, and current run state — why that product, and why not the other common options, is settled in the [OLTP database deep dive](#7-deep-dive-design-oltp-database). ClickHouse is the planned OLAP store for historical logs, node traces, and analytics.
 
 Execution checkpoints need strong correctness. Observability can be eventually consistent; a few milliseconds before a trace appears is acceptable.
 
@@ -809,7 +810,7 @@ stateDiagram-v2
 
 **Interviewer:** A workflow is a graph, so why not put everything in one JSON document or a graph database?
 
-**Candidate:** The graph shape is important, but so are relational guarantees. A run must point to a real published version, an edge must not cross versions, and a checkpoint must belong to the exact graph the run pinned. PostgreSQL gives us those constraints while JSONB handles type-specific node configuration.
+**Candidate:** The graph shape is important, but so are relational guarantees. A run must point to a real published version, an edge must not cross versions, and a checkpoint must belong to the exact graph the run pinned. PostgreSQL gives us those constraints while JSONB handles type-specific node configuration. Which Postgres _product_ we run (RDS vs Aurora vs the rest of the market) is decided in the [OLTP database deep dive](#7-deep-dive-design-oltp-database).
 
 > [!NOTE]
 > This section covers the baseline tables. Later deep dives extend the schema as decisions are made — the [execution deep dive](#6-deep-dive-design-execution) already adds an outbox table, a retry counter, and their integrity constraints, explained [with examples there](#what-this-deep-dive-changed-in-the-schema).
@@ -1592,7 +1593,7 @@ Same outcome — fast jobs get quick rescue, slow jobs get room — sized by the
 
 So the property we actually need is less "always answers" and more "never forgets": **durability of accepted messages**. SQS gives both — multi-AZ replication makes the frozen-run trap structurally impossible — which is why the availability question dissolved once the product was chosen.
 
-One gap stays on the books: a **stalled-run sweeper** — a periodic job that finds runs stuck in `running` with no pending outbox row and no plausible in-flight lease, and re-mints the job from `current_node_id` + `current_node_attempt`. It is the only mechanism that would make "Postgres knows where every run stands" _actionable_, and it would also catch a message silently expiring after 14 days in the main queue. **Deferred, deliberately:** SQS's durability removes the scary version of the failure, and v1 stays small. It is recorded in [the deferred list](#7-deep-dives-still-to-come), not forgotten.
+One gap stays on the books: a **stalled-run sweeper** — a periodic job that finds runs stuck in `running` with no pending outbox row and no plausible in-flight lease, and re-mints the job from `current_node_id` + `current_node_attempt`. It is the only mechanism that would make "Postgres knows where every run stands" _actionable_, and it would also catch a message silently expiring after 14 days in the main queue. **Deferred, deliberately:** SQS's durability removes the scary version of the failure, and v1 stays small. It is recorded in [the deferred list](#8-deep-dives-still-to-come), not forgotten.
 
 ### What the DLQ watcher does with the evidence
 
@@ -1633,11 +1634,110 @@ The locked rule: **the DLQ is a quarantine and an evidence bag, never a work lis
 
 **Decision: poll-only for v1.** The hybrid (NOTIFY fast path + slow poll backstop) is a pure optimization that changes no contracts, so it can be bolted on the day latency matters.
 
-## 7. Deep Dives Still To Come
+## 7. Deep-Dive Design: OLTP Database
+
+> [!IMPORTANT]
+> This decision is also drawn on the [`orchex.excalidraw`](./orchex.excalidraw) board — look for **Orchex — OLTP Database Decision** (to the right of the Queue Decision board): requirements, market cards, RDS pick, flow, and capacity check.
+
+This deep dive names the OLTP product. Section 5 already locked **relational PostgreSQL** for integrity. Here we answer: why not NoSQL, why not every other SQL product on the market, and why **Amazon RDS for PostgreSQL** over Aurora or a distributed database.
+
+Assumptions carried in from scale and execution:
+
+- write-heavy execution path (checkpoint + outbox every hop);
+- ~10 new runs/s steady, ~100/s peak;
+- ~10 hops per run → about **100 / 1000 hop transactions per second**;
+- capacity conversation includes ~60k concurrent runs when workflows run longer than a minute;
+- queue is already **AWS SQS**, so v1 lives on AWS;
+- v1 is **one region** (one writer). Multi-region active writes are out of scope for now.
+
+### Why a relational database at all?
+
+**Interviewer:** Execution is write-heavy and we added an outbox, which means even more writes. Why not DynamoDB or Mongo and keep life simple?
+
+**Candidate:** The outbox does not remove the need for a database that can reject bad data. Two things must be true in the same commit: the run checkpoint advances, and the next job row exists. Different systems (Postgres and SQS) cannot share one commit, so we write checkpoint + outbox together, and the relay pushes to SQS later. Delay is fine; loss is not.
+
+NoSQL can do multi-item transactions. What we refuse to demote to application hope is:
+
+1. **Same-version integrity** — edges, checkpoints, and outbox rows must point at nodes of the run’s pinned version. Cross-version junk must be impossible.
+2. **Uniqueness the database enforces** — e.g. at most one draft per workflow, unique node names per version, one edge label per source.
+
+Those are composite foreign keys and unique / partial-unique rules. On a document store we would reimplement them in every writer. For Orchex, the database is the last line of defense.
+
+### What we need from the OLTP product
+
+**Interviewer:** In plain words, what must the product give us?
+
+**Candidate:**
+
+1. Real SQL transactions (checkpoint + outbox in one go).
+2. Foreign keys and unique rules as designed in [`schema.dbml`](./schema.dbml).
+3. A change stream later (CDC / Debezium) so we can replace the poll relay without rewriting the app.
+4. Enough write speed for ~1000 hop TPS at peak, with headroom.
+5. Managed operations on AWS at a cost we can live with in v1.
+
+### Walk the market (simple language)
+
+**Interviewer:** Walk the options like you are explaining them to someone who does not live in database internals.
+
+**Candidate:**
+
+| Option                                    | What it is, in one breath                                         | Pros for Orchex                                                                                       | Cons / why it loses                                                                                                           |
+| ----------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Amazon RDS for PostgreSQL**             | Normal Postgres, AWS runs backups, patching, and failover for you | Exact schema fit; Debezium-ready; cheaper than Aurora; matches SQS/AWS home; proven enough at our TPS | One writer (fine for v1); you still choose instance size                                                                      |
+| **Amazon Aurora PostgreSQL**              | Postgres for the app, special AWS storage under the hood          | Faster failover, storage grows itself, nice HA story                                                  | Costs more; we do not need that comfort yet after capacity tests                                                              |
+| **Self-managed Postgres**                 | You install Postgres on machines yourself                         | Full control, no RDS fee                                                                              | We become the DBA team — wrong trade for v1                                                                                   |
+| **AlloyDB (GCP)**                         | Google’s managed Postgres-compatible DB                           | Strong managed Postgres on GCP                                                                        | Wrong cloud while the queue is SQS                                                                                            |
+| **MySQL / Aurora MySQL / MariaDB**        | Another popular relational database                               | Solid OLTP, CDC exists                                                                                | Our schema is Postgres-shaped (partial unique “one draft”, composite FKs, JSONB habits). Switching means redesign for no gain |
+| **CockroachDB / YugabyteDB**              | SQL that automatically splits across many machines                | Horizontal writes, multi-region survival                                                              | Overkill for one-region ~1000 TPS; more latency/complexity/license than we need                                               |
+| **TiDB**                                  | Distributed SQL that speaks MySQL                                 | Huge scale, optional analytics engine                                                                 | MySQL dialect + distributed model fights our design                                                                           |
+| **Google Spanner**                        | Google’s global relational database                               | Extreme global consistency                                                                            | Different API, high cost, global features we are not buying in v1                                                             |
+| **Citus / Vitess (sharding)**             | Split one logical DB into many shards                             | Scale writes by cutting the data                                                                      | Cross-shard foreign keys get weak or die — exactly the integrity we refused to drop                                           |
+| **Neon / Supabase (serverless Postgres)** | Real Postgres, great for branching and early product              | Nice for previews/dev                                                                                 | Not the bet for a busy production execution spine                                                                             |
+| **Oracle / SQL Server**                   | Big enterprise databases                                          | Mature and powerful                                                                                   | License and culture mismatch; Postgres already covers the need                                                                |
+| **DynamoDB / Mongo / “just JSON”**        | Document or key-value stores                                      | Easy horizontal stories for some apps                                                                 | No native composite FK / partial-unique story for our graph/run/outbox rules                                                  |
+
+### Why RDS PostgreSQL wins
+
+**Interviewer:** So compress that into the decision.
+
+**Candidate:**
+
+1. **Relational Postgres is mandatory** for the integrity rules above — not optional polish.
+2. **AWS is home** because SQS is already the queue; AlloyDB/Spanner pull us into another cloud for no reason.
+3. **Distributed SQL and sharding are premature** — our peak write shape is hundreds to low thousands of small transactions per second, not “one machine cannot keep up.”
+4. **Aurora is a luxury, not a requirement** — better failover and storage automation, higher bill. We would revisit if HA/ops pain shows up.
+5. **RDS is the cost/simplicity default** that still speaks full PostgreSQL, including the path to CDC later.
+
+**The decision: Amazon RDS for PostgreSQL.** One region, one writer, managed by AWS.
+
+### Did we check the size is enough?
+
+**Interviewer:** Fine philosophy. Can a small RDS actually take the write load?
+
+**Candidate:** We load-tested the real schema with an Orchex-shaped mix (checkpoint update + outbox insert + relay-style delete) under Docker CPU/RAM caps. Full notes live in [`bench/postgres/results/`](./bench/postgres/results/).
+
+Plain results for **10 hops/run** (so steady ≈ 100 hop TPS, peak ≈ 1000 hop TPS):
+
+| Box (Docker caps) | Steady ~100 hop TPS | Peak ~1000 hop TPS                                                                         |
+| ----------------- | ------------------- | ------------------------------------------------------------------------------------------ |
+| 2 vCPU / 4 GB     | Pass                | Pass (comfortable)                                                                         |
+| 1 vCPU / 2 GB     | Pass                | Pass only if DB client concurrency stays low; fails when too many clients fight the outbox |
+
+**Planning default: an RDS instance in the 2 vCPU / 4 GB class** for peak comfort. 1 vCPU / 2 GB is a possible cost floor for steady traffic, not the safe peak default. These are capacity _signals_, not a promise that a specific RDS class equals Docker — but they show the SQL mix is nowhere near needing Aurora Limitless or Cockroach on day one.
+
+Memory was not the story: the active run table stayed small (tens of MB at 60k seeded runs). CPU and lock contention under too many clients were.
+
+### What we are explicitly not deciding here
+
+**Interviewer:** What stays open?
+
+**Candidate:** Exact RDS instance class and Multi-AZ vs Single-AZ purchase options; parameter-group tuning (`shared_buffers`, connection pooling with RDS Proxy / PgBouncer); when to move the relay from poll to Debezium; any multi-region active-active topology. Those are operations follow-ups, not a reopen of “which database family.”
+
+## 8. Deep Dives Still To Come
 
 **Interviewer:** Is everything settled now?
 
-**Candidate:** No. The execution spine and the queue product are settled; these are next:
+**Candidate:** No. The execution spine, the queue product, and the OLTP database product are settled; these are next:
 
 - durable run context and node-output propagation (how a node's output reaches the next node);
 - pause/stop races and long-running node interruption;
@@ -1679,8 +1779,9 @@ These are not hidden assumptions. They are the next decisions the design needs.
 
 **Candidate:**
 
-- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, and queue-product decision board.
+- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, and OLTP/RDS decision board.
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
+- [`bench/postgres`](./bench/postgres) — Docker + pgbench harness and capacity notes behind the RDS decision.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
 - [`data-structure`](./data-structure) — Go graph implementation and learning notes.
 
