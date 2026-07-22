@@ -1,0 +1,5 @@
+# Keep summary markdown; ignore noisy run artifacts.
+raw_*/
+_host_*.txt
+run_log*.txt
+raw_1c_2g_peak_retry.txt
