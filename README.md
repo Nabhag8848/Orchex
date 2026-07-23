@@ -17,7 +17,7 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, and the OLTP/RDS decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, the OLTP/RDS decision, and the graph data-structure board. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
@@ -41,7 +41,8 @@ This document tells the story of the design as a conversation between an intervi
 - [5. Schema Design](#5-schema-design)
 - [6. Deep-Dive Design: Execution](#6-deep-dive-design-execution)
 - [7. Deep-Dive Design: OLTP Database](#7-deep-dive-design-oltp-database)
-- [8. Deep Dives Still To Come](#8-deep-dives-still-to-come)
+- [8. Deep-Dive Design: Graph Data Structure](#8-deep-dive-design-graph-data-structure)
+- [9. Deep Dives Still To Come](#9-deep-dives-still-to-come)
 
 ## 1. Functional Requirements
 
@@ -110,7 +111,7 @@ Agent, Router, and Scheduler nodes are intentionally deferred. The schema-driven
 
 **Candidate:** A DAG gives us a finite execution path and a valid topological order. More importantly, it keeps v1 recovery understandable: a worker executes a node, stores a checkpoint, and schedules the next node. A cycle would turn that into loop semantics—iteration limits, repeated state, and more complicated retry rules—which is a separate feature rather than a small extension.
 
-The Go implementation in [`data-structure`](./data-structure) demonstrates degree checks, cycle detection, and topological sorting with Kahn's algorithm. Reachability from Start is a useful learning check there, but it is not yet part of the published hard-validation checklist.
+How we represent that graph in memory, check degrees, detect cycles, and derive an execution order is covered in the [graph data-structure deep dive](#8-deep-dive-design-graph-data-structure). The Go sketches in [`data-structure`](./data-structure) are the learning notes behind that board. Reachability from Start is a useful check there, but it is not yet part of the published hard-validation checklist.
 
 ### How does draft and publish work?
 
@@ -1739,11 +1740,166 @@ Memory was not the story: the active run table stayed small (tens of MB at 60k s
 
 **Candidate:** Exact RDS instance class and Multi-AZ vs Single-AZ purchase options; parameter-group tuning (`shared_buffers`, connection pooling with RDS Proxy / PgBouncer); when to move the relay from poll to Debezium; any multi-region active-active topology. Those are operations follow-ups, not a reopen of “which database family.”
 
-## 8. Deep Dives Still To Come
+## 8. Deep-Dive Design: Graph Data Structure
+
+> This decision is also drawn on the [`orchex.excalidraw`](./orchex.excalidraw) board — adjacency, degrees, DAG vs cycle, Kahn peel, and the Orchex mapping in picture form. The Go sketches in [`data-structure`](./data-structure) are the practice notes behind these ideas.
+
+### What do we actually store?
+
+**Interviewer:** A workflow is a graph. What data structure do we use for it?
+
+**Candidate:** A **directed adjacency list** — plain language: for every step, remember the set of steps that may run next.
+
+```mermaid
+flowchart LR
+  subgraph store["Adjacency list"]
+    Start["Start → { API }"]
+    API["API → { Conditional }"]
+    Cond["Conditional → { true: FuncA, false: FuncB }"]
+    FuncA["FuncA → { Response }"]
+    FuncB["FuncB → { Response }"]
+  end
+```
+
+Think of it as a phone book of “who comes after whom,” not a big matrix of every possible pair. Looking up the next steps for one node is cheap. Storage grows with the number of nodes plus the number of wires — not with “every node times every node.”
+
+We keep edges **directed**. `A → B` means B may run after A. The reverse is a different wire. That matches execution: work flows forward, not both ways.
+
+| Idea | Simple meaning | Orchex use |
+| ---- | -------------- | ---------- |
+| Node | A step on the canvas | Start, API, Conditional, … |
+| Directed edge | A one-way wire | “run this after that” |
+| Adjacency list | Per-node “next steps” | Fast “what runs next?” |
+
+### How do in-degree and out-degree guide the builder?
+
+**Interviewer:** What do “in” and “out” mean for a node?
+
+**Candidate:** **Out-degree** is how many wires leave a node. **In-degree** is how many wires enter it.
+
+```mermaid
+flowchart LR
+  Start((Start)) -->|out = 1| API[API]
+  API -->|out = 1| Cond{Conditional}
+  Cond -->|true| A[Function A]
+  Cond -->|false| B[Function B]
+  A --> R1[Response]
+  B --> R2[Response]
+```
+
+| Role on the canvas | Degrees | Everyday reading |
+| ------------------ | ------- | ---------------- |
+| **Start** | in `0`, out `1` | Nothing before it; exactly one first step |
+| **API / Function / Integration** | in `1`, out `1` | One predecessor, one successor — a straight link |
+| **Conditional** | in `1`, out `2` | One way in; two labeled ways out (`true` / `false`) |
+| **Response** | in `1`, out `0` | One way in; nothing after — the run finishes |
+
+Those rules are why v1 has **no merge**: two branches may not rejoin into one node (`in > 1`). Fan-in would need an explicit Join later; for now each branch keeps its own path.
+
+### Why must a published graph be a DAG?
+
+**Interviewer:** What breaks if someone wires a loop?
+
+**Candidate:** A **DAG** is a directed graph with **no cycles**. Publish requires that shape so execution can always make progress and so a topological order exists.
+
+```mermaid
+flowchart LR
+  subgraph ok["DAG — publishable"]
+    S1[Start] --> A1[API] --> R1[Response]
+  end
+
+  subgraph bad["Cycle — reject on publish"]
+    X[A] --> Y[B] --> Z[C] --> X
+  end
+```
+
+| Without a DAG | With a DAG |
+| ------------- | ---------- |
+| Scheduler can chase the same steps forever | Every run has a finite path |
+| No safe “run A before B” list for the whole graph | A topological order always exists |
+| Retry and checkpoint semantics grow into loop features | Checkpoint → next node stays simple |
+
+Drafts may be messy while someone is drawing. **Publish** is where we insist: non-empty, acyclic, and degree rules satisfied.
+
+### How do we detect a cycle without drowning in theory?
+
+**Interviewer:** How do we know there is a loop?
+
+**Candidate:** Prefer **Kahn’s peel** — it matches how a scheduler thinks.
+
+1. Count unfinished dependencies for every node (that count is the in-degree).
+2. Put every node with **zero** unfinished dependencies in a ready queue (Start is always ready first).
+3. “Run” one ready node: remove it, and for each neighbor subtract one dependency.
+4. When a neighbor hits zero, it becomes ready.
+5. Repeat until nothing is ready.
+
+```mermaid
+flowchart TB
+  Q["Ready queue: nodes with in-degree 0"]
+  Peel["Peel one node — mark it done"]
+  Dec["Decrement neighbors’ unfinished counts"]
+  Ready["Any neighbor now at 0? → enqueue"]
+  Done{"Peeled every node?"}
+  DAG["No cycle — graph is a DAG"]
+  Cycle["Nodes left with in ≥ 1 — cycle"]
+
+  Q --> Peel --> Dec --> Ready --> Peel
+  Peel --> Done
+  Done -->|yes| DAG
+  Done -->|no, queue empty| Cycle
+```
+
+If you peel **every** node, there was no cycle. If the queue empties while nodes remain, every leftover node is waiting on another leftover node — mutual blocking — a **cycle**.
+
+Depth-first “three-color” walking can also find cycles (you walk into a step you have not finished yet). Either answer is fine for publish validation. Kahn is the natural fit because the peel order is already a schedule.
+
+### How does that become an execution order?
+
+**Interviewer:** Once we know it is a DAG, how do we decide what can run when?
+
+**Candidate:** A **topological order** lists every node so that for each wire `A → B`, A appears before B. That is one valid execution schedule.
+
+```mermaid
+flowchart LR
+  Start --> API --> Response
+```
+
+One topological order: `Start → API → Response`.
+
+Kahn’s peel **is** that schedule: each time you peel a ready node, append it to the order. Branches can allow more than one valid order; v1 still keeps each path independent (no join), so the worker simply follows the chosen next edge after each node — Conditional picks `true` or `false`, everything else has a single successor.
+
+### Structure vs meaning — two layers
+
+**Interviewer:** Is the adjacency list enough by itself?
+
+**Candidate:** No. We keep two layers in sync:
+
+| Layer | Holds | Answers |
+| ----- | ----- | ------- |
+| **Structure** | Nodes and directed edges (the adjacency list) | What is wired to what? Degrees? Cycles? Order? |
+| **Meaning** | Node type and config (Start, API, …) | What does this step *do*, and which degree rules apply? |
+
+Validation walks both: every wired node must have a type, every type must satisfy its in/out rules, and the whole graph must be a DAG. The builder canvas positions are layout only — they do not change execution.
+
+### What we lock for v1
+
+**Interviewer:** What is settled for the graph structure itself?
+
+**Candidate:**
+
+1. **Directed adjacency list** as the working representation for validation and “what’s next.”
+2. **Typed degree rules** per node type (table above).
+3. **Publish requires a DAG**; drafts may be incomplete.
+4. **Kahn-style peel** as the preferred way to detect cycles and to produce an execution order.
+5. **No fan-in / join** in v1 — branches do not rejoin.
+
+Postgres still owns durable truth (versioned `nodes` / `edges` rows). The adjacency list is how we *think and check* the graph; the relational schema is how we *store* it safely across versions and runs.
+
+## 9. Deep Dives Still To Come
 
 **Interviewer:** Is everything settled now?
 
-**Candidate:** No. The execution spine, the queue product, and the OLTP database product are settled; these are next:
+**Candidate:** No. The execution spine, the queue product, the OLTP database product, and the graph data-structure model are settled; these are next:
 
 - durable run context and node-output propagation (how a node's output reaches the next node);
 - pause/stop races and long-running node interruption;
@@ -1785,10 +1941,10 @@ These are not hidden assumptions. They are the next decisions the design needs.
 
 **Candidate:**
 
-- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, and OLTP/RDS decision board.
+- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, OLTP/RDS, and graph data-structure board.
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
 - [`bench/postgres`](./bench/postgres) — Docker + pgbench harness and capacity notes behind the RDS decision.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
-- [`data-structure`](./data-structure) — Go graph implementation and learning notes.
+- [`data-structure`](./data-structure) — Go graph sketches and learning notes behind the graph data-structure deep dive.
 
 The design has one recurring principle: let drafts be easy to build, make published workflows safe to run, and never lose the exact point from which a failed run should continue.
