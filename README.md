@@ -226,9 +226,15 @@ Execution checkpoints need strong correctness. Observability can be eventually c
 
 ### Which architecture did we choose?
 
-**Interviewer:** Why not use Step Functions or Temporal for the whole system?
+**Interviewer:** Why not use SWF, Step Functions, or Temporal for the whole system?
 
-**Candidate:** Both are good tools for different products. Step Functions fits an AWS-native internal tool. Temporal fits an internal system that wants a mature durable execution engine. Orchex is itself a workflow-builder product, so it needs to own DAG progression, branching, checkpoints, retries, and the builder semantics.
+**Candidate:** They solve overlapping problems for different products.
+
+- **Amazon SWF** is AWS’s older fully-managed state tracker: it stores execution history and coordinates decision/activity tasks, while your workers still run the real work. Fine for legacy or custom-worker setups; for new AWS-native work it is largely superseded by Step Functions.
+- **Step Functions** fits an AWS-native internal tool — you define a state machine and AWS runs and persists it.
+- **Temporal** fits an internal system that wants a mature durable-execution engine (history, replay, activities) without building that layer from scratch.
+
+Orchex is itself a workflow-builder product, so it needs to own DAG progression, branching, checkpoints, retries, and the builder semantics. We take the queues-and-workers path, and use sandboxes like Durable Lambda only for isolating untrusted function code — not as the orchestrator.
 
 The selected design is a queue-and-worker control plane, with isolated execution only where a node requires it.
 
