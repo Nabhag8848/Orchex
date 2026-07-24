@@ -17,7 +17,7 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, the OLTP/RDS decision, and the graph data-structure board. [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw) holds the control-plane compute decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, the OLTP/RDS decision, the graph data-structure board, and the control-plane compute decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
@@ -1900,7 +1900,7 @@ Postgres still owns durable truth (versioned `nodes` / `edges` rows). The adjace
 ## 9. Deep-Dive Design: Control Plane Compute
 
 > [!IMPORTANT]
-> Where Orchex's long-running services run and how they scale. SQS and RDS are already on AWS, so compute stays there. Function-node sandboxing is a separate deep dive. Board: [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw).
+> Where Orchex's long-running services run and how they scale. SQS and RDS are already on AWS, so compute stays there. Function-node sandboxing is a separate deep dive. Board: [`orchex.excalidraw`](./orchex.excalidraw).
 
 **Interviewer:** Builder, Execution, relay, DLQ watcher, and workers all need to run somewhere and scale independently. What are the options?
 
@@ -1986,8 +1986,7 @@ These are not hidden assumptions. They are the next decisions the design needs.
 
 **Candidate:**
 
-- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, OLTP/RDS, and graph data-structure board.
-- [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw) — control-plane compute decision (ECS on Fargate).
+- [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, OLTP/RDS, graph data-structure, and control-plane compute (ECS on Fargate) board.
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
 - [`bench/postgres`](./bench/postgres) — Docker + pgbench harness and capacity notes behind the RDS decision.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
