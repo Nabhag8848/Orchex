@@ -17,7 +17,7 @@ That sounds simple until the first practical questions arrive. What happens whil
 This document tells the story of the design as a conversation between an interviewer and a candidate. It is intentionally separated into functional requirements, non-functional requirements, high-level design, API design, schema design, and the deep dives we will add later.
 
 > [!IMPORTANT]
-> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, the OLTP/RDS decision, and the graph data-structure board. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
+> [`orchex.excalidraw`](./orchex.excalidraw) is the source of truth for architecture, API, schema, the execution deep dive, the queue-product decision, the OLTP/RDS decision, and the graph data-structure board. [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw) holds the control-plane compute decision. [`schema.dbml`](./schema.dbml) defines the PostgreSQL model, [`bench/postgres`](./bench/postgres) holds the OLTP capacity harness behind the RDS decision, [`node-type-schemas`](./node-type-schemas) contains the executable node contracts, and [`data-structure`](./data-structure) contains the graph experiments that informed the design.
 
 ### At a glance
 
@@ -30,6 +30,7 @@ This document tells the story of the design as a conversation between an intervi
 | Definitions  | Mutable draft, immutable published version                          |
 | Execution    | Outbox + relay → SQS → workers; DLQ after 5 deliveries              |
 | Storage      | Amazon RDS for PostgreSQL (OLTP); ClickHouse planned for OLAP       |
+| Compute      | Amazon ECS on Fargate (APIs, relay, workers)                        |
 | Scale target | 1M runs/day and 100 QPS burst ingestion                             |
 
 ### Contents
@@ -42,7 +43,8 @@ This document tells the story of the design as a conversation between an intervi
 - [6. Deep-Dive Design: Execution](#6-deep-dive-design-execution)
 - [7. Deep-Dive Design: OLTP Database](#7-deep-dive-design-oltp-database)
 - [8. Deep-Dive Design: Graph Data Structure](#8-deep-dive-design-graph-data-structure)
-- [9. Deep Dives Still To Come](#9-deep-dives-still-to-come)
+- [9. Deep-Dive Design: Control Plane Compute](#9-deep-dive-design-control-plane-compute)
+- [10. Deep Dives Still To Come](#10-deep-dives-still-to-come)
 
 ## 1. Functional Requirements
 
@@ -237,7 +239,7 @@ Execution checkpoints need strong correctness. Observability can be eventually c
 
 Orchex is itself a workflow-builder product, so it needs to own DAG progression, branching, checkpoints, retries, and the builder semantics. We take the queues-and-workers path, and use sandboxes like Durable Lambda only for isolating untrusted function code — not as the orchestrator.
 
-The selected design is a queue-and-worker control plane, with isolated execution only where a node requires it.
+The selected design is a queue-and-worker control plane, with isolated execution only where a node requires it. Where that control plane runs — **ECS on Fargate** — is settled in the [control plane compute deep dive](#9-deep-dive-design-control-plane-compute).
 
 ```mermaid
 flowchart LR
@@ -1765,11 +1767,11 @@ Think of it as a phone book of “who comes after whom,” not a big matrix of e
 
 We keep edges **directed**. `A → B` means B may run after A. The reverse is a different wire. That matches execution: work flows forward, not both ways.
 
-| Idea | Simple meaning | Orchex use |
-| ---- | -------------- | ---------- |
-| Node | A step on the canvas | Start, API, Conditional, … |
-| Directed edge | A one-way wire | “run this after that” |
-| Adjacency list | Per-node “next steps” | Fast “what runs next?” |
+| Idea           | Simple meaning        | Orchex use                 |
+| -------------- | --------------------- | -------------------------- |
+| Node           | A step on the canvas  | Start, API, Conditional, … |
+| Directed edge  | A one-way wire        | “run this after that”      |
+| Adjacency list | Per-node “next steps” | Fast “what runs next?”     |
 
 ### How do in-degree and out-degree guide the builder?
 
@@ -1787,12 +1789,12 @@ flowchart LR
   B --> R2[Response]
 ```
 
-| Role on the canvas | Degrees | Everyday reading |
-| ------------------ | ------- | ---------------- |
-| **Start** | in `0`, out `1` | Nothing before it; exactly one first step |
-| **API / Function / Integration** | in `1`, out `1` | One predecessor, one successor — a straight link |
-| **Conditional** | in `1`, out `2` | One way in; two labeled ways out (`true` / `false`) |
-| **Response** | in `1`, out `0` | One way in; nothing after — the run finishes |
+| Role on the canvas               | Degrees         | Everyday reading                                    |
+| -------------------------------- | --------------- | --------------------------------------------------- |
+| **Start**                        | in `0`, out `1` | Nothing before it; exactly one first step           |
+| **API / Function / Integration** | in `1`, out `1` | One predecessor, one successor — a straight link    |
+| **Conditional**                  | in `1`, out `2` | One way in; two labeled ways out (`true` / `false`) |
+| **Response**                     | in `1`, out `0` | One way in; nothing after — the run finishes        |
 
 Those rules are why v1 has **no merge**: two branches may not rejoin into one node (`in > 1`). Fan-in would need an explicit Join later; for now each branch keeps its own path.
 
@@ -1813,10 +1815,10 @@ flowchart LR
   end
 ```
 
-| Without a DAG | With a DAG |
-| ------------- | ---------- |
-| Scheduler can chase the same steps forever | Every run has a finite path |
-| No safe “run A before B” list for the whole graph | A topological order always exists |
+| Without a DAG                                          | With a DAG                          |
+| ------------------------------------------------------ | ----------------------------------- |
+| Scheduler can chase the same steps forever             | Every run has a finite path         |
+| No safe “run A before B” list for the whole graph      | A topological order always exists   |
 | Retry and checkpoint semantics grow into loop features | Checkpoint → next node stays simple |
 
 Drafts may be messy while someone is drawing. **Publish** is where we insist: non-empty, acyclic, and degree rules satisfied.
@@ -1874,10 +1876,10 @@ Kahn’s peel **is** that schedule: each time you peel a ready node, append it t
 
 **Candidate:** No. We keep two layers in sync:
 
-| Layer | Holds | Answers |
-| ----- | ----- | ------- |
-| **Structure** | Nodes and directed edges (the adjacency list) | What is wired to what? Degrees? Cycles? Order? |
-| **Meaning** | Node type and config (Start, API, …) | What does this step *do*, and which degree rules apply? |
+| Layer         | Holds                                         | Answers                                                 |
+| ------------- | --------------------------------------------- | ------------------------------------------------------- |
+| **Structure** | Nodes and directed edges (the adjacency list) | What is wired to what? Degrees? Cycles? Order?          |
+| **Meaning**   | Node type and config (Start, API, …)          | What does this step _do_, and which degree rules apply? |
 
 Validation walks both: every wired node must have a type, every type must satisfy its in/out rules, and the whole graph must be a DAG. The builder canvas positions are layout only — they do not change execution.
 
@@ -1893,13 +1895,56 @@ Validation walks both: every wired node must have a type, every type must satisf
 4. **Kahn-style peel** as the preferred way to detect cycles and to produce an execution order.
 5. **No fan-in / join** in v1 — branches do not rejoin.
 
-Postgres still owns durable truth (versioned `nodes` / `edges` rows). The adjacency list is how we *think and check* the graph; the relational schema is how we *store* it safely across versions and runs.
+Postgres still owns durable truth (versioned `nodes` / `edges` rows). The adjacency list is how we _think and check_ the graph; the relational schema is how we _store_ it safely across versions and runs.
 
-## 9. Deep Dives Still To Come
+## 9. Deep-Dive Design: Control Plane Compute
+
+> [!IMPORTANT]
+> Where Orchex's long-running services run and how they scale. SQS and RDS are already on AWS, so compute stays there. Function-node sandboxing is a separate deep dive. Board: [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw).
+
+**Interviewer:** Builder, Execution, relay, DLQ watcher, and workers all need to run somewhere and scale independently. What are the options?
+
+**Candidate:** Two layers — **orchestrator** (keep N replicas healthy) and **capacity** (where CPU/RAM come from):
+
+| Orchestrator                             | Capacity                                                  |
+| ---------------------------------------- | --------------------------------------------------------- |
+| **ECS** — AWS-native container scheduler | **Fargate** (serverless tasks) or **EC2** (our instances) |
+| **EKS** — managed Kubernetes             | **Fargate** or **EC2**                                    |
+
+```text
+Client → ALB → Builder / Execution → RDS
+                      │
+                      └─ relay → SQS → Workers
+```
+
+APIs scale on ALB load; workers on SQS backlog; relay/DLQ watcher stay at a small fixed replica count. ~60k concurrent runs ≠ 60k tasks — workers are I/O-bound and one replica can hold many in-flight jobs.
+
+### The four options
+
+|          | ECS + Fargate                                                                                           | ECS + EC2                                                                              | EKS + Fargate                                                              | EKS + EC2                                            |
+| -------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **What** | ECS schedules tasks; Fargate provisions CPU/RAM per task                                                | ECS places tasks on an EC2 autoscaling group we operate                                | Same serverless capacity, Kubernetes control plane                         | Full K8s on node groups                              |
+| **Pros** | No host management; lowest ops; native ALB + SQS autoscaling; fastest to ship                           | Better $/vCPU when the worker fleet is large and steady; same ECS task defs as Fargate | No hosts; K8s portability / ecosystem                                      | Max control, packing, Spot                           |
+| **Cons** | Less machine-level control; cold starts if warm floor is too low; higher unit cost at huge steady scale | We own patching, bin-packing, and a second scaling loop (tasks + ASG)                  | K8s learning curve; EKS control-plane fee; more moving parts than v1 needs | Highest ops burden; slowest path to a minimal Orchex |
+
+### Decision: ECS on Fargate
+
+**Interviewer:** Lock it.
+
+**Candidate:**
+
+1. **No host management in v1** — Fargate, not EC2.
+2. **ECS over EKS** — we do not need Kubernetes yet.
+3. **EC2 under ECS** remains a later cost escape hatch (same services, different capacity).
+4. **EKS** only if the org already mandates Kubernetes.
+
+**The decision: Amazon ECS on Fargate** for Builder, Execution, relay, DLQ watcher, and workers — same region as RDS and SQS.
+
+## 10. Deep Dives Still To Come
 
 **Interviewer:** Is everything settled now?
 
-**Candidate:** No. The execution spine, the queue product, the OLTP database product, and the graph data-structure model are settled; these are next:
+**Candidate:** No. The execution spine, the queue product, the OLTP database product, the graph data-structure model, and the control-plane compute product (ECS on Fargate) are settled; these are next:
 
 - durable run context and node-output propagation (how a node's output reaches the next node);
 - pause/stop races and long-running node interruption;
@@ -1942,6 +1987,7 @@ These are not hidden assumptions. They are the next decisions the design needs.
 **Candidate:**
 
 - [`orchex.excalidraw`](./orchex.excalidraw) — authoritative architecture, API, schema, execution deep-dive, queue-product, OLTP/RDS, and graph data-structure board.
+- [`orchex-control-plane-compute.excalidraw`](./orchex-control-plane-compute.excalidraw) — control-plane compute decision (ECS on Fargate).
 - [`schema.dbml`](./schema.dbml) — PostgreSQL OLTP schema.
 - [`bench/postgres`](./bench/postgres) — Docker + pgbench harness and capacity notes behind the RDS decision.
 - [`node-type-schemas`](./node-type-schemas) — JSON Schema contracts for all six node types.
